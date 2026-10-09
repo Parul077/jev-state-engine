@@ -2,9 +2,11 @@ import inspect
 import json
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -332,6 +334,47 @@ def _accepts_param(fn: Any, param_name: str) -> bool:
         return (param_name in sig.parameters) or has_kwargs
     except Exception:
         return False
+
+
+def _safe_escalate_deadlock(
+    gatekeeper: Any,
+    trajectory: List[Dict[str, Any]],
+    triggering_tier: str,
+    integration_branch: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> None:
+    if gatekeeper is None or not hasattr(gatekeeper, "escalate_deadlock"):
+        return
+    from jev.gatekeeper import Gatekeeper
+    if isinstance(gatekeeper, Gatekeeper):
+        eff_thread_id = thread_id
+        if not eff_thread_id and integration_branch:
+            eff_thread_id = integration_branch.replace("jev-ticket-", "")
+        gatekeeper.escalate_deadlock(
+            trajectory=trajectory,
+            triggering_tier=triggering_tier,
+            thread_id=eff_thread_id,
+            integration_branch=integration_branch,
+        )
+    else:
+        kwargs: Dict[str, Any] = {}
+        target = getattr(gatekeeper.escalate_deadlock, "side_effect", None) or gatekeeper.escalate_deadlock
+        try:
+            sig = inspect.signature(target)
+            has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not has_var_kwargs and "integration_branch" in sig.parameters:
+                if integration_branch:
+                    kwargs["integration_branch"] = integration_branch
+            elif has_var_kwargs and integration_branch:
+                kwargs["integration_branch"] = integration_branch
+        except Exception:
+            if integration_branch:
+                kwargs["integration_branch"] = integration_branch
+        gatekeeper.escalate_deadlock(
+            trajectory=trajectory,
+            triggering_tier=triggering_tier,
+            **kwargs,
+        )
 
 
 def _extract_content_text(content: Any) -> str:
@@ -1263,11 +1306,12 @@ def node_plan(
                         "error": f"API failure after 5 retries: {e}",
                         "subgoals": [],
                     })
-                    if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-                        gatekeeper.escalate_deadlock(
-                            trajectory=state["trajectory"],
-                            triggering_tier="planning",
-                        )
+                    _safe_escalate_deadlock(
+                        gatekeeper,
+                        trajectory=state["trajectory"],
+                        triggering_tier="planning",
+                        thread_id=state.get("thread_id"),
+                    )
                     return state
                 sleep_time = 25 if ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)) else (5 * (api_attempt + 1))
                 time.sleep(sleep_time)
@@ -1359,11 +1403,12 @@ def node_plan(
         "subgoals": [],
         "grounding_checks": fail_grounding_checks,
     })
-    if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-        gatekeeper.escalate_deadlock(
-            trajectory=state["trajectory"],
-            triggering_tier="planning",
-        )
+    _safe_escalate_deadlock(
+        gatekeeper,
+        trajectory=state["trajectory"],
+        triggering_tier="planning",
+        thread_id=state.get("thread_id"),
+    )
     return state
 
 
@@ -1425,8 +1470,24 @@ def node_implement(
                 path: Path to the file to modify, relative to repository root.
                 content: The complete new content of the file.
             """
-            norm_path = Path(path).as_posix().lstrip("./")
-            norm_scope = {Path(s).as_posix().lstrip("./") for s in (subgoal.scope or [])}
+            # Strip only a leading './'
+            norm_path = Path(path).as_posix()
+            if norm_path.startswith("./"):
+                norm_path = norm_path[2:]
+
+            norm_scope = set()
+            for s in (subgoal.scope or []):
+                s_norm = Path(s).as_posix()
+                if s_norm.startswith("./"):
+                    s_norm = s_norm[2:]
+                norm_scope.add(s_norm)
+
+            if hasattr(workspace, "resolve_in_worktree"):
+                try:
+                    workspace.resolve_in_worktree(path)
+                except (ValueError, PermissionError) as e:
+                    return f"Error: Access denied: path '{path}' escapes worktree: {e}"
+
             if norm_scope and norm_path not in norm_scope:
                 return (
                     f"Error: Target path '{path}' is not within declared scope {subgoal.scope}. "
@@ -1435,7 +1496,10 @@ def node_implement(
                 )
 
             if hasattr(workspace, "stage_file_mutation"):
-                workspace.stage_file_mutation(path, content)
+                try:
+                    workspace.stage_file_mutation(path, content)
+                except (ValueError, PermissionError) as e:
+                    return f"Error: Access denied staging mutation for '{path}': {e}"
                 return f"Successfully staged mutation for {path}"
             return f"Workspace unavailable; could not stage mutation for {path}"
 
@@ -1584,8 +1648,6 @@ def node_implement(
                     except Exception:
                         args = {}
 
-                executed_tools.append({"name": name, "args": args})
-
                 if name == "submit_subgoal":
                     submitted = True
                     result = "Subgoal submitted."
@@ -1595,24 +1657,56 @@ def node_implement(
                     if actual_content is None:
                         actual_content = args.get("code", args.get("text", ""))
 
-                    norm_path = Path(actual_path).as_posix().lstrip("./")
-                    norm_scope = {Path(s).as_posix().lstrip("./") for s in (subgoal.scope or [])}
-                    if norm_scope and norm_path not in norm_scope:
-                        result = (
-                            f"Error: Target path '{actual_path}' is not within declared scope {subgoal.scope}. "
-                            "You may only mutate files within the declared scope for this subgoal. "
-                            "Subsequent subgoals will address other files."
-                        )
-                    elif actual_path and hasattr(workspace, "stage_file_mutation"):
+                    norm_path = Path(actual_path).as_posix()
+                    if norm_path.startswith("./"):
+                        norm_path = norm_path[2:]
+
+                    norm_scope = set()
+                    for s in (subgoal.scope or []):
+                        s_norm = Path(s).as_posix()
+                        if s_norm.startswith("./"):
+                            s_norm = s_norm[2:]
+                        norm_scope.add(s_norm)
+
+                    if hasattr(workspace, "resolve_in_worktree"):
                         try:
-                            workspace.stage_file_mutation(actual_path, actual_content)
-                            result = f"Successfully staged mutation for {actual_path}"
-                        except Exception as e:
-                            result = f"Error staging mutation for {actual_path}: {e}"
+                            workspace.resolve_in_worktree(actual_path)
+                        except (ValueError, PermissionError) as e:
+                            result = f"Error: Access denied: path '{actual_path}' escapes worktree: {e}"
+                        else:
+                            if norm_scope and norm_path not in norm_scope:
+                                result = (
+                                    f"Error: Target path '{actual_path}' is not within declared scope {subgoal.scope}. "
+                                    "You may only mutate files within the declared scope for this subgoal. "
+                                    "Subsequent subgoals will address other files."
+                                )
+                            elif actual_path and hasattr(workspace, "stage_file_mutation"):
+                                try:
+                                    workspace.stage_file_mutation(actual_path, actual_content)
+                                    result = f"Successfully staged mutation for {actual_path}"
+                                except Exception as e:
+                                    result = f"Error staging mutation for {actual_path}: {e}"
+                            else:
+                                result = f"Error: path is required for {name}."
                     else:
-                        result = f"Error: path is required for {name}."
+                        if norm_scope and norm_path not in norm_scope:
+                            result = (
+                                f"Error: Target path '{actual_path}' is not within declared scope {subgoal.scope}. "
+                                "You may only mutate files within the declared scope for this subgoal. "
+                                "Subsequent subgoals will address other files."
+                            )
+                        elif actual_path and hasattr(workspace, "stage_file_mutation"):
+                            try:
+                                workspace.stage_file_mutation(actual_path, actual_content)
+                                result = f"Successfully staged mutation for {actual_path}"
+                            except Exception as e:
+                                result = f"Error staging mutation for {actual_path}: {e}"
+                        else:
+                            result = f"Error: path is required for {name}."
                 else:
                     result = f"Unknown tool: {name}. Available tools: stage_file_mutation, submit_subgoal."
+
+                executed_tools.append({"name": name, "args": args, "result": result})
 
                 messages.append(
                     ToolMessage(
@@ -1862,12 +1956,13 @@ def node_gate(
                 "jev_verdict": None,
             })
 
-            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-                gatekeeper.escalate_deadlock(
-                    trajectory=state.get("trajectory", []),
-                    triggering_tier="mechanical",
-                    integration_branch=state.get("integration_branch"),
-                )
+            _safe_escalate_deadlock(
+                gatekeeper,
+                trajectory=state.get("trajectory", []),
+                triggering_tier="mechanical",
+                integration_branch=state.get("integration_branch"),
+                thread_id=state.get("thread_id"),
+            )
             return state
 
         current_mech_strikes = state.get("mechanical_strike_count", 0) + 1
@@ -1892,14 +1987,13 @@ def node_gate(
             "jev_verdict": None,
         })
 
-        if current_mech_strikes >= 3 and gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-            kwargs: Dict[str, Any] = {}
-            if state.get("integration_branch"):
-                kwargs["integration_branch"] = state.get("integration_branch")
-            gatekeeper.escalate_deadlock(
+        if current_mech_strikes >= 3:
+            _safe_escalate_deadlock(
+                gatekeeper,
                 trajectory=state.get("trajectory", []),
                 triggering_tier="mechanical",
-                **kwargs,
+                integration_branch=state.get("integration_branch"),
+                thread_id=state.get("thread_id"),
             )
         return state
 
@@ -1947,11 +2041,12 @@ def node_gate(
                     "error": err_msg,
                     "gate_status": "merge_failed",
                 })
-                if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-                    gatekeeper.escalate_deadlock(
-                        trajectory=state.get("trajectory", []),
-                        triggering_tier="merge",
-                    )
+                _safe_escalate_deadlock(
+                    gatekeeper,
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="merge",
+                    thread_id=state.get("thread_id"),
+                )
                 return state
             try:
                 workspace.merge_subgoal_worktree(
@@ -1969,12 +2064,13 @@ def node_gate(
                     "error": str(e),
                     "gate_status": "merge_failed",
                 })
-                if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-                    gatekeeper.escalate_deadlock(
-                        trajectory=state.get("trajectory", []),
-                        triggering_tier="merge",
-                        integration_branch=target_branch,
-                    )
+                _safe_escalate_deadlock(
+                    gatekeeper,
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier="merge",
+                    integration_branch=target_branch,
+                    thread_id=state.get("thread_id"),
+                )
                 return state
         elif is_worktree_active:
             # An active worktree was created, but worktree state is missing from state or merge method missing!
@@ -1996,12 +2092,13 @@ def node_gate(
                 "error": err_msg,
                 "gate_status": "merge_failed",
             })
-            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-                gatekeeper.escalate_deadlock(
-                    trajectory=state.get("trajectory", []),
-                    triggering_tier="worktree",
-                    integration_branch=state.get("integration_branch"),
-                )
+            _safe_escalate_deadlock(
+                gatekeeper,
+                trajectory=state.get("trajectory", []),
+                triggering_tier="worktree",
+                integration_branch=state.get("integration_branch"),
+                thread_id=state.get("thread_id"),
+            )
             return state
         elif hasattr(workspace, "commit_subgoal"):
             workspace.commit_subgoal()
@@ -2060,14 +2157,13 @@ def node_gate(
             "jev_verdict": jev_verdict_telemetry,
         })
 
-        if current_sem_strikes >= 3 and hasattr(gatekeeper, "escalate_deadlock"):
-            kwargs: Dict[str, Any] = {}
-            if state.get("integration_branch"):
-                kwargs["integration_branch"] = state.get("integration_branch")
-            gatekeeper.escalate_deadlock(
+        if current_sem_strikes >= 3:
+            _safe_escalate_deadlock(
+                gatekeeper,
                 trajectory=state.get("trajectory", []),
                 triggering_tier="semantic",
-                **kwargs,
+                integration_branch=state.get("integration_branch"),
+                thread_id=state.get("thread_id"),
             )
 
         return state
@@ -2130,15 +2226,13 @@ def node_verify(
                 "jev_verdict": None,
             }
             state["trajectory"].append(verify_entry)
-            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-                kwargs: Dict[str, Any] = {}
-                if integration_branch:
-                    kwargs["integration_branch"] = integration_branch
-                gatekeeper.escalate_deadlock(
-                    trajectory=state.get("trajectory", []),
-                    triggering_tier="mechanical",
-                    **kwargs,
-                )
+            _safe_escalate_deadlock(
+                gatekeeper,
+                trajectory=state.get("trajectory", []),
+                triggering_tier="mechanical",
+                integration_branch=integration_branch,
+                thread_id=state.get("thread_id"),
+            )
             return state
 
         # 2. Run unit tests
@@ -2175,15 +2269,13 @@ def node_verify(
                 "jev_verdict": None,
             }
             state["trajectory"].append(verify_entry)
-            if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-                kwargs: Dict[str, Any] = {}
-                if integration_branch:
-                    kwargs["integration_branch"] = integration_branch
-                gatekeeper.escalate_deadlock(
-                    trajectory=state.get("trajectory", []),
-                    triggering_tier="mechanical",
-                    **kwargs,
-                )
+            _safe_escalate_deadlock(
+                gatekeeper,
+                trajectory=state.get("trajectory", []),
+                triggering_tier="mechanical",
+                integration_branch=integration_branch,
+                thread_id=state.get("thread_id"),
+            )
             return state
 
         # Determine if any subgoals expected automated tests
@@ -2295,14 +2387,13 @@ def node_verify(
 
         state["trajectory"].append(verify_entry)
 
-        if state.get("gate_status") == "verification_failed" and gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-            kwargs: Dict[str, Any] = {}
-            if integration_branch:
-                kwargs["integration_branch"] = integration_branch
-            gatekeeper.escalate_deadlock(
+        if state.get("gate_status") == "verification_failed":
+            _safe_escalate_deadlock(
+                gatekeeper,
                 trajectory=state.get("trajectory", []),
                 triggering_tier="verification",
-                **kwargs,
+                integration_branch=integration_branch,
+                thread_id=state.get("thread_id"),
             )
         return state
 
@@ -2326,15 +2417,13 @@ def node_verify(
             },
             "jev_verdict": None,
         })
-        if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-            kwargs = {}
-            if integration_branch:
-                kwargs["integration_branch"] = integration_branch
-            gatekeeper.escalate_deadlock(
-                trajectory=state.get("trajectory", []),
-                triggering_tier="verification",
-                **kwargs,
-            )
+        _safe_escalate_deadlock(
+            gatekeeper,
+            trajectory=state.get("trajectory", []),
+            triggering_tier="verification",
+            integration_branch=integration_branch,
+            thread_id=state.get("thread_id"),
+        )
         return state
 
     except Exception as e:
@@ -2356,15 +2445,13 @@ def node_verify(
             },
             "jev_verdict": None,
         })
-        if gatekeeper is not None and hasattr(gatekeeper, "escalate_deadlock"):
-            kwargs = {}
-            if integration_branch:
-                kwargs["integration_branch"] = integration_branch
-            gatekeeper.escalate_deadlock(
-                trajectory=state.get("trajectory", []),
-                triggering_tier="verification",
-                **kwargs,
-            )
+        _safe_escalate_deadlock(
+            gatekeeper,
+            trajectory=state.get("trajectory", []),
+            triggering_tier="verification",
+            integration_branch=integration_branch,
+            thread_id=state.get("thread_id"),
+        )
         return state
 
     finally:
@@ -2517,7 +2604,12 @@ class JevEngine:
 
         return builder.compile(checkpointer=self.checkpointer)
 
-    def execute(self, ticket: str, thread_id: str = "default") -> State:
+    def execute(self, ticket: str, thread_id: Optional[str] = None) -> State:
+        if thread_id is None:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            rnd = uuid.uuid4().hex[:4]
+            thread_id = f"run-{ts}-{rnd}"
+
         base_commit = None
         if self.workspace is not None:
             if hasattr(self.workspace, "base_commit") and self.workspace.base_commit:
@@ -2526,6 +2618,33 @@ class JevEngine:
                 base_commit = self.workspace._get_head_commit()
 
         integration_branch = f"jev-ticket-{thread_id}"
+
+        has_checkpoint = False
+        if self.checkpointer is not None:
+            try:
+                cp = self.checkpointer.get({"configurable": {"thread_id": thread_id}})
+                if cp is not None:
+                    has_checkpoint = True
+            except Exception:
+                pass
+
+        branch_exists = False
+        if self.workspace is not None and hasattr(self.workspace, "_run_repo_git"):
+            try:
+                res = self.workspace._run_repo_git(["rev-parse", "--verify", integration_branch])
+                if res.returncode == 0:
+                    branch_exists = True
+            except Exception:
+                pass
+
+        if has_checkpoint or branch_exists:
+            warning_msg = (
+                f"WARNING: Thread '{thread_id}' already has existing checkpoints or integration branch '{integration_branch}'. "
+                f"Restarting thread from scratch and deleting prior integration branch (no resume)."
+            )
+            print(warning_msg, file=sys.stderr, flush=True)
+            print(warning_msg, flush=True)
+
         if self.workspace is not None and hasattr(self.workspace, "create_integration_branch"):
             self.workspace.create_integration_branch(integration_branch, base_commit=base_commit)
 

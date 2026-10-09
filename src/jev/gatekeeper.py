@@ -235,13 +235,30 @@ class Gatekeeper:
         triggering_tier: str,
         log_path: Union[str, Path] = "escalation.log",
         integration_branch: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        **kwargs: Any,
     ) -> None:
-        """Logs deadlock escalation details and dumps escalation.log for HITL review."""
-        log_file = Path(log_path)
+        """Logs deadlock escalation details and dumps escalation output for HITL review."""
         content: Dict[str, Any] = {
             "triggering_tier": triggering_tier,
             "trajectory": trajectory,
         }
         if integration_branch:
             content["integration_branch"] = integration_branch
-        log_file.write_text(json.dumps(content, indent=2, default=str), encoding="utf-8")
+        if thread_id:
+            content["thread_id"] = thread_id
+
+        # Write to $JEV_HOME/runs/<thread_id>/escalation.json
+        jev_home_dir = Path(os.environ.get("JEV_HOME", Path.home() / ".jev")).expanduser().resolve()
+        if thread_id:
+            run_dir = jev_home_dir / "runs" / thread_id
+            run_dir.mkdir(parents=True, exist_ok=True)
+            run_file = run_dir / "escalation.json"
+            run_file.write_text(json.dumps(content, indent=2, default=str), encoding="utf-8")
+
+        # Also write to local log_path (e.g. escalation.log) for backwards compatibility
+        log_file = Path(log_path)
+        try:
+            log_file.write_text(json.dumps(content, indent=2, default=str), encoding="utf-8")
+        except Exception:
+            pass

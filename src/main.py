@@ -11,6 +11,16 @@ from jev.gatekeeper import Gatekeeper
 from jev.workspace import Workspace
 
 
+import uuid
+from datetime import datetime, timezone
+
+
+def generate_default_thread_id() -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rnd = uuid.uuid4().hex[:4]
+    return f"run-{ts}-{rnd}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Jev State Engine: Deterministic State Machine with Two-Tier Gating"
@@ -35,8 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--thread-id",
         type=str,
-        default="main-thread",
-        help="Execution thread identifier for checkpoint persistence",
+        default=generate_default_thread_id(),
+        help="Execution thread identifier for checkpoint persistence (defaults to run-<utc-timestamp>-<4 hex>)",
     )
     parser.add_argument(
         "--test-policy",

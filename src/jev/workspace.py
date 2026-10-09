@@ -433,19 +433,72 @@ class Workspace:
             check=check,
         )
 
+    def resolve_in_worktree(self, path: Union[str, Path]) -> Path:
+        """Resolves path within worktree_dir, enforcing strict containment.
+
+        Rejects:
+        - Absolute paths (POSIX starting with '/', Windows drive letters e.g. 'C:', UNC paths)
+        - Paths with '..' segments (relative parent traversal)
+        - Symlinks pointing outside worktree_dir
+        - Backslash or mixed-slash parent traversal
+        Preserves:
+        - Dot-files like '.env', '.gitignore'
+        - Leading relative directory paths like '.github/workflows/ci.yml'
+        """
+        import posixpath
+        raw_str = str(path).strip()
+        norm_posix = raw_str.replace("\\", "/")
+        worktree_root = self.worktree_dir.resolve()
+
+        p = Path(path)
+        if norm_posix.startswith("/") or re.match(r"^[a-zA-Z]:", raw_str) or p.is_absolute():
+            try:
+                resolved_p = p.resolve()
+                rel = resolved_p.relative_to(worktree_root)
+                norm_rel = posixpath.normpath(rel.as_posix())
+                if norm_rel == ".." or norm_rel.startswith("../"):
+                    raise ValueError(f"Path '{path}' traverses outside worktree.")
+                return worktree_root / norm_rel
+            except (ValueError, RuntimeError):
+                raise ValueError(f"Absolute path '{path}' is not allowed within worktree.")
+
+        if norm_posix.startswith("./"):
+            stripped = norm_posix[2:]
+        else:
+            stripped = norm_posix
+
+        normalized = posixpath.normpath(stripped)
+        parts = normalized.split("/")
+        if ".." in parts or normalized == ".." or normalized.startswith("../"):
+            raise ValueError(f"Path '{path}' traverses outside worktree.")
+
+        candidate = self.worktree_dir / normalized
+        resolved_candidate = candidate.resolve()
+        try:
+            resolved_candidate.relative_to(worktree_root)
+        except ValueError:
+            raise PermissionError(f"Path '{path}' resolves outside worktree to '{resolved_candidate}'.")
+
+        return candidate
+
     def run_read_tool(self, cmd: str, args: Optional[List[str]] = None) -> str:
         """Executes read-only CLI commands in worktree_dir and returns stdout or stderr."""
         args_list = args or []
         full_cmd = [cmd] + args_list
-        if cmd == "cat" and not shutil.which("cat"):
-            if args_list:
+
+        # Enforce path containment on file reading commands (e.g. cat) across all platforms
+        if cmd == "cat" and args_list:
+            for arg in args_list:
+                if not arg.startswith("-"):
+                    try:
+                        self.resolve_in_worktree(arg)
+                    except (ValueError, PermissionError) as e:
+                        return f"cat: {arg}: Access denied outside workspace: {e}"
+
+            if not shutil.which("cat"):
                 target = Path(args_list[0])
                 if not target.is_absolute():
                     target = self.worktree_dir / target
-                try:
-                    target.resolve().relative_to(self.worktree_dir.resolve())
-                except ValueError:
-                    return f"cat: {args_list[0]}: Access denied outside workspace"
                 if target.is_dir():
                     return f"cat: {args_list[0]}: Is a directory"
                 if target.exists() and target.is_file():
@@ -454,7 +507,7 @@ class Workspace:
                     except Exception as e:
                         return str(e)
                 return f"cat: {args_list[0]}: No such file or directory"
-            return ""
+
         try:
             res = subprocess.run(
                 full_cmd,
@@ -471,10 +524,6 @@ class Workspace:
                 target = Path(args_list[0])
                 if not target.is_absolute():
                     target = self.worktree_dir / target
-                try:
-                    target.resolve().relative_to(self.worktree_dir.resolve())
-                except ValueError:
-                    return f"cat: {args_list[0]}: Access denied outside workspace"
                 if target.is_dir():
                     return f"cat: {args_list[0]}: Is a directory"
                 if target.exists() and target.is_file():
@@ -486,18 +535,11 @@ class Workspace:
             return f"Command not found: {cmd}"
 
     def stage_file_mutation(self, path: Union[str, Path], content: str) -> None:
-        p = Path(path)
-        if p.is_absolute():
-            try:
-                rel_path = p.resolve().relative_to(self.worktree_dir.resolve())
-            except ValueError:
-                rel_path = p
-        else:
-            rel_path = p
-        target_path = self.worktree_dir / rel_path
+        target_path = self.resolve_in_worktree(path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(content, encoding="utf-8")
-        self._run_git(["add", str(rel_path)])
+        rel_to_wt = target_path.relative_to(self.worktree_dir)
+        self._run_git(["add", rel_to_wt.as_posix()])
 
     def get_staged_diff(self) -> str:
         self._run_git(["add", "-A"])
@@ -612,9 +654,13 @@ class Workspace:
             try:
                 content = exclude_file.read_text(encoding="utf-8")
                 entries = []
-                if ".jev-worktrees" not in content:
+                if ".jev-worktrees" not in content.splitlines():
+                    entries.append(".jev-worktrees")
+                if ".jev-worktrees/" not in content.splitlines():
                     entries.append(".jev-worktrees/")
-                if "node_modules" not in content:
+                if "node_modules" not in content.splitlines():
+                    entries.append("node_modules")
+                if "node_modules/" not in content.splitlines():
                     entries.append("node_modules/")
                 if entries:
                     exclude_file.write_text(content.rstrip() + "\n" + "\n".join(entries) + "\n", encoding="utf-8")
@@ -1239,7 +1285,10 @@ class Workspace:
 
         norm_scope = {Path(f).as_posix() for f in scope_list}
         out_of_scope = [
-            f for f in sorted(touched_files) if Path(f).as_posix() not in norm_scope
+            f for f in sorted(touched_files)
+            if Path(f).as_posix() not in norm_scope
+            and not Path(f).as_posix().startswith((".jev-worktrees", "node_modules"))
+            and Path(f).name != "node_modules"
         ]
 
         if out_of_scope:
@@ -1785,9 +1834,13 @@ class Workspace:
             try:
                 content = exclude_file.read_text(encoding="utf-8")
                 entries = []
-                if ".jev-worktrees" not in content:
+                if ".jev-worktrees" not in content.splitlines():
+                    entries.append(".jev-worktrees")
+                if ".jev-worktrees/" not in content.splitlines():
                     entries.append(".jev-worktrees/")
-                if "node_modules" not in content:
+                if "node_modules" not in content.splitlines():
+                    entries.append("node_modules")
+                if "node_modules/" not in content.splitlines():
                     entries.append("node_modules/")
                 if entries:
                     exclude_file.write_text(content.rstrip() + "\n" + "\n".join(entries) + "\n", encoding="utf-8")

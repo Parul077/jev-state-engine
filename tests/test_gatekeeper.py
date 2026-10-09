@@ -1,4 +1,6 @@
 import inspect
+import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 import httpx
 import pytest
@@ -168,8 +170,14 @@ def test_env_vars_loaded_from_dotenv_only(monkeypatch, tmp_path):
 
 
 # 28. Live integration test with real Jev API
+@pytest.mark.live
 def test_live_jev_api_call():
     """Verify live call against https://api.typesafe.ai/v1/systemone using real JEV_API_KEY from .env."""
+    from dotenv import dotenv_values
+    env_vals = dotenv_values(".env") if Path(".env").exists() else {}
+    api_key = os.environ.get("JEV_API_KEY") or env_vals.get("JEV_API_KEY")
+    if not api_key:
+        pytest.skip("JEV_API_KEY not configured; skipping live test")
     gk = Gatekeeper()  # Loads real JEV_API_URL and JEV_API_KEY from .env
     subgoal = Subgoal(
         description="Implement a helper function add(a, b) returning sum",

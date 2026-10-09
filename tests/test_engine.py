@@ -350,7 +350,7 @@ def test_main_cli_success(tmp_path, monkeypatch):
         mock_gk_cls.return_value = mock_gk
         mock_eng_cls.return_value = mock_eng
 
-        exit_code = main.main(["Fix login bug", "--db-path", str(db_file)])
+        exit_code = main.main(["Fix login bug", "--thread-id", "main-thread", "--db-path", str(db_file)])
         assert exit_code == 0
         mock_eng.execute.assert_called_once_with(ticket="Fix login bug", thread_id="main-thread")
 
