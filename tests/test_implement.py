@@ -39,6 +39,12 @@ class MockWorkspace:
     def __init__(self):
         self.staged_mutations: List[Dict[str, str]] = []
 
+    def resolve_in_worktree(self, path: Any) -> Path:
+        raw = str(path).replace("\\", "/")
+        if ".." in raw.split("/") or raw.startswith("/"):
+            raise ValueError(f"Path '{path}' traverses outside worktree.")
+        return Path(path)
+
     def stage_file_mutation(self, path: str, content: str) -> None:
         self.staged_mutations.append({"path": str(path), "content": content})
 

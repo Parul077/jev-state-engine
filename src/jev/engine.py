@@ -1462,15 +1462,15 @@ def node_implement(
     if llm is not None and subgoal is not None and workspace is not None:
         submitted = False
 
-        @tool
-        def stage_file_mutation(path: str, content: str) -> str:
-            """Stage a file mutation (create or overwrite file content) in the workspace worktree.
+        def _execute_stage_file_mutation(path: str, content: str) -> str:
+            if not path:
+                return "Error: path is required for stage_file_mutation."
 
-            Args:
-                path: Path to the file to modify, relative to repository root.
-                content: The complete new content of the file.
-            """
-            # Strip only a leading './'
+            try:
+                workspace.resolve_in_worktree(path)
+            except (ValueError, PermissionError) as e:
+                return f"Error: Access denied: path '{path}' escapes worktree: {e}"
+
             norm_path = Path(path).as_posix()
             if norm_path.startswith("./"):
                 norm_path = norm_path[2:]
@@ -1482,12 +1482,6 @@ def node_implement(
                     s_norm = s_norm[2:]
                 norm_scope.add(s_norm)
 
-            if hasattr(workspace, "resolve_in_worktree"):
-                try:
-                    workspace.resolve_in_worktree(path)
-                except (ValueError, PermissionError) as e:
-                    return f"Error: Access denied: path '{path}' escapes worktree: {e}"
-
             if norm_scope and norm_path not in norm_scope:
                 return (
                     f"Error: Target path '{path}' is not within declared scope {subgoal.scope}. "
@@ -1498,10 +1492,22 @@ def node_implement(
             if hasattr(workspace, "stage_file_mutation"):
                 try:
                     workspace.stage_file_mutation(path, content)
+                    return f"Successfully staged mutation for {path}"
                 except (ValueError, PermissionError) as e:
                     return f"Error: Access denied staging mutation for '{path}': {e}"
-                return f"Successfully staged mutation for {path}"
+                except Exception as e:
+                    return f"Error staging mutation for {path}: {e}"
             return f"Workspace unavailable; could not stage mutation for {path}"
+
+        @tool
+        def stage_file_mutation(path: str, content: str) -> str:
+            """Stage a file mutation (create or overwrite file content) in the workspace worktree.
+
+            Args:
+                path: Path to the file to modify, relative to repository root.
+                content: The complete new content of the file.
+            """
+            return _execute_stage_file_mutation(path, content)
 
         @tool
         def submit_subgoal(notes: str = "") -> str:
@@ -1656,57 +1662,11 @@ def node_implement(
                     actual_content = args.get("content")
                     if actual_content is None:
                         actual_content = args.get("code", args.get("text", ""))
-
-                    norm_path = Path(actual_path).as_posix()
-                    if norm_path.startswith("./"):
-                        norm_path = norm_path[2:]
-
-                    norm_scope = set()
-                    for s in (subgoal.scope or []):
-                        s_norm = Path(s).as_posix()
-                        if s_norm.startswith("./"):
-                            s_norm = s_norm[2:]
-                        norm_scope.add(s_norm)
-
-                    if hasattr(workspace, "resolve_in_worktree"):
-                        try:
-                            workspace.resolve_in_worktree(actual_path)
-                        except (ValueError, PermissionError) as e:
-                            result = f"Error: Access denied: path '{actual_path}' escapes worktree: {e}"
-                        else:
-                            if norm_scope and norm_path not in norm_scope:
-                                result = (
-                                    f"Error: Target path '{actual_path}' is not within declared scope {subgoal.scope}. "
-                                    "You may only mutate files within the declared scope for this subgoal. "
-                                    "Subsequent subgoals will address other files."
-                                )
-                            elif actual_path and hasattr(workspace, "stage_file_mutation"):
-                                try:
-                                    workspace.stage_file_mutation(actual_path, actual_content)
-                                    result = f"Successfully staged mutation for {actual_path}"
-                                except Exception as e:
-                                    result = f"Error staging mutation for {actual_path}: {e}"
-                            else:
-                                result = f"Error: path is required for {name}."
-                    else:
-                        if norm_scope and norm_path not in norm_scope:
-                            result = (
-                                f"Error: Target path '{actual_path}' is not within declared scope {subgoal.scope}. "
-                                "You may only mutate files within the declared scope for this subgoal. "
-                                "Subsequent subgoals will address other files."
-                            )
-                        elif actual_path and hasattr(workspace, "stage_file_mutation"):
-                            try:
-                                workspace.stage_file_mutation(actual_path, actual_content)
-                                result = f"Successfully staged mutation for {actual_path}"
-                            except Exception as e:
-                                result = f"Error staging mutation for {actual_path}: {e}"
-                        else:
-                            result = f"Error: path is required for {name}."
+                    result = _execute_stage_file_mutation(actual_path, str(actual_content))
                 else:
                     result = f"Unknown tool: {name}. Available tools: stage_file_mutation, submit_subgoal."
 
-                executed_tools.append({"name": name, "args": args, "result": result})
+                executed_tools.append({"name": name, "args": args, "result": str(result)[:200]})
 
                 messages.append(
                     ToolMessage(

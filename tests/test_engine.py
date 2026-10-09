@@ -64,6 +64,12 @@ class FakeWorkspace:
     def run_tests(self):
         return self.test_outcome
 
+    def resolve_in_worktree(self, path):
+        raw = str(path).replace("\\", "/")
+        if ".." in raw.split("/") or raw.startswith("/"):
+            raise ValueError(f"Path '{path}' traverses outside worktree.")
+        return Path(path)
+
     def stage_file_mutation(self, path, content):
         pass
 

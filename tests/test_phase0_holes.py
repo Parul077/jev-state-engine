@@ -253,3 +253,84 @@ def test_rerun_restarts_with_loud_warning_when_checkpoint_exists(tmp_path, capsy
     combined_output = captured.out + captured.err
     assert "restart" in combined_output.lower() or "warning" in combined_output.lower()
     assert thread_id in combined_output
+
+
+# ==============================================================================
+# node_modules Read vs Write containment tests
+# ==============================================================================
+
+def test_workspace_run_read_tool_allows_reading_in_node_modules(tmp_path):
+    """Workspace.run_read_tool allows reading files resolving inside <repo_dir>/node_modules."""
+    _init_git_repo(tmp_path)
+    nm_pkg = tmp_path / "node_modules" / "some-lib"
+    nm_pkg.mkdir(parents=True, exist_ok=True)
+    pkg_file = nm_pkg / "index.js"
+    pkg_file.write_text("module.exports = { value: 'from_node_modules' };", encoding="utf-8")
+
+    ws = Workspace(repo_dir=tmp_path)
+
+    # 1. Base workspace read
+    out = ws.run_read_tool("cat", ["node_modules/some-lib/index.js"])
+    assert "from_node_modules" in out
+    assert "Access denied" not in out
+
+    # 2. Subgoal worktree read (node_modules is symlinked/accessible)
+    wt_path = ws.create_subgoal_worktree(1)
+    try:
+        out_wt = ws.run_read_tool("cat", ["node_modules/some-lib/index.js"])
+        assert "from_node_modules" in out_wt
+        assert "Access denied" not in out_wt
+    finally:
+        ws.discard_subgoal_worktree(wt_path)
+
+
+def test_workspace_stage_file_mutation_blocks_writing_to_node_modules(tmp_path):
+    """Workspace.stage_file_mutation strictly blocks writing into node_modules."""
+    _init_git_repo(tmp_path)
+    nm_pkg = tmp_path / "node_modules" / "some-lib"
+    nm_pkg.mkdir(parents=True, exist_ok=True)
+    pkg_file = nm_pkg / "index.js"
+    pkg_file.write_text("initial_clean_code", encoding="utf-8")
+
+    ws = Workspace(repo_dir=tmp_path)
+
+    # 1. Direct write to node_modules must be blocked
+    with pytest.raises((PermissionError, ValueError)):
+        ws.stage_file_mutation("node_modules/some-lib/index.js", "malicious_overwrite")
+    assert pkg_file.read_text(encoding="utf-8") == "initial_clean_code"
+
+    # 2. Inside a worktree, write to node_modules must also be blocked
+    wt_path = ws.create_subgoal_worktree(1)
+    try:
+        with pytest.raises((PermissionError, ValueError)):
+            ws.stage_file_mutation("node_modules/some-lib/index.js", "malicious_overwrite")
+        assert pkg_file.read_text(encoding="utf-8") == "initial_clean_code"
+    finally:
+        ws.discard_subgoal_worktree(wt_path)
+
+
+def test_workspace_run_read_tool_blocks_traversal_through_node_modules(tmp_path):
+    """Workspace.run_read_tool strictly blocks node_modules/../../x parent traversal."""
+    _init_git_repo(tmp_path)
+    nm_dir = tmp_path / "node_modules"
+    nm_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create secret outside repo
+    secret_file = tmp_path.parent / "super_secret.txt"
+    secret_file.write_text("SUPER_SECRET_TOKEN", encoding="utf-8")
+
+    ws = Workspace(repo_dir=tmp_path)
+
+    # Traversal attempting to reach outside repo via node_modules
+    out = ws.run_read_tool("cat", [f"node_modules/../../{secret_file.name}"])
+    assert "Access denied" in out or "outside" in out.lower()
+    assert "SUPER_SECRET_TOKEN" not in out
+
+    # Generic node_modules/../../x traversal
+    out_x = ws.run_read_tool("cat", ["node_modules/../../x"])
+    assert "Access denied" in out_x or "outside" in out_x.lower()
+
+    # And write traversal must also be blocked
+    with pytest.raises((PermissionError, ValueError)):
+        ws.stage_file_mutation("node_modules/../../x", "bad")
+

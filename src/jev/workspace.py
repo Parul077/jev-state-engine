@@ -481,24 +481,72 @@ class Workspace:
 
         return candidate
 
+    def _resolve_for_read(self, path: Union[str, Path]) -> Path:
+        """Resolves path for reading in run_read_tool only.
+
+        Enforces strict worktree containment by default via resolve_in_worktree(),
+        but allows reads that resolve strictly inside <repo_dir>/node_modules.
+        Traversal using '..' (e.g. node_modules/../../x) is strictly blocked.
+        """
+        import posixpath
+        try:
+            return self.resolve_in_worktree(path)
+        except (ValueError, PermissionError) as original_err:
+            raw_str = str(path).strip()
+            norm_posix = raw_str.replace("\\", "/")
+            nm_dir = self.repo_dir / "node_modules"
+
+            if not nm_dir.exists():
+                raise original_err
+
+            nm_root = nm_dir.resolve()
+            p = Path(path)
+            if norm_posix.startswith("/") or re.match(r"^[a-zA-Z]:", raw_str) or p.is_absolute():
+                try:
+                    resolved_p = p.resolve()
+                    resolved_p.relative_to(nm_root)
+                    return resolved_p
+                except ValueError:
+                    raise original_err
+
+            if norm_posix.startswith("./"):
+                stripped = norm_posix[2:]
+            else:
+                stripped = norm_posix
+
+            normalized = posixpath.normpath(stripped)
+            parts = normalized.split("/")
+            if ".." in parts or normalized == ".." or normalized.startswith("../"):
+                raise ValueError(f"Path '{path}' traverses outside workspace.")
+
+            candidate = (self.repo_dir / normalized).resolve()
+            try:
+                candidate.relative_to(nm_root)
+                return candidate
+            except ValueError:
+                raise original_err
+
     def run_read_tool(self, cmd: str, args: Optional[List[str]] = None) -> str:
         """Executes read-only CLI commands in worktree_dir and returns stdout or stderr."""
         args_list = args or []
         full_cmd = [cmd] + args_list
 
+        resolved_target: Optional[Path] = None
         # Enforce path containment on file reading commands (e.g. cat) across all platforms
         if cmd == "cat" and args_list:
+            resolved_args: List[str] = []
             for arg in args_list:
                 if not arg.startswith("-"):
                     try:
-                        self.resolve_in_worktree(arg)
+                        resolved_target = self._resolve_for_read(arg)
+                        resolved_args.append(str(resolved_target))
                     except (ValueError, PermissionError) as e:
                         return f"cat: {arg}: Access denied outside workspace: {e}"
+                else:
+                    resolved_args.append(arg)
 
             if not shutil.which("cat"):
-                target = Path(args_list[0])
-                if not target.is_absolute():
-                    target = self.worktree_dir / target
+                target = resolved_target if resolved_target is not None else (self.worktree_dir / args_list[0])
                 if target.is_dir():
                     return f"cat: {args_list[0]}: Is a directory"
                 if target.exists() and target.is_file():
@@ -507,6 +555,8 @@ class Workspace:
                     except Exception as e:
                         return str(e)
                 return f"cat: {args_list[0]}: No such file or directory"
+
+            full_cmd = [cmd] + resolved_args
 
         try:
             res = subprocess.run(
@@ -521,9 +571,7 @@ class Workspace:
 
         except FileNotFoundError:
             if cmd == "cat" and args_list:
-                target = Path(args_list[0])
-                if not target.is_absolute():
-                    target = self.worktree_dir / target
+                target = resolved_target if resolved_target is not None else (self.worktree_dir / args_list[0])
                 if target.is_dir():
                     return f"cat: {args_list[0]}: Is a directory"
                 if target.exists() and target.is_file():
@@ -535,7 +583,19 @@ class Workspace:
             return f"Command not found: {cmd}"
 
     def stage_file_mutation(self, path: Union[str, Path], content: str) -> None:
+        raw_str = str(path).replace("\\", "/").strip()
+        if raw_str.startswith("./"):
+            raw_str = raw_str[2:]
+        if raw_str == "node_modules" or raw_str.startswith("node_modules/"):
+            raise PermissionError(f"Modifying files in node_modules is blocked: '{path}'.")
+
         target_path = self.resolve_in_worktree(path)
+        try:
+            target_path.resolve().relative_to((self.repo_dir / "node_modules").resolve())
+            raise PermissionError(f"Modifying files in node_modules is blocked: '{path}'.")
+        except ValueError:
+            pass
+
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(content, encoding="utf-8")
         rel_to_wt = target_path.relative_to(self.worktree_dir)
@@ -1285,10 +1345,7 @@ class Workspace:
 
         norm_scope = {Path(f).as_posix() for f in scope_list}
         out_of_scope = [
-            f for f in sorted(touched_files)
-            if Path(f).as_posix() not in norm_scope
-            and not Path(f).as_posix().startswith((".jev-worktrees", "node_modules"))
-            and Path(f).name != "node_modules"
+            f for f in sorted(touched_files) if Path(f).as_posix() not in norm_scope
         ]
 
         if out_of_scope:
