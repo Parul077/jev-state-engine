@@ -156,6 +156,10 @@ class Gatekeeper:
 
         reason = valid_entry.get("reason")
 
+        model_name = data.get("model") if isinstance(data, dict) else None
+        usage = data.get("usage") if isinstance(data, dict) else None
+        raw_resp = data if isinstance(data, dict) else None
+
         # Format 1: Mock / explicit format with 'value' and 'probability'
         if "value" in valid_entry and "probability" in valid_entry:
             value = valid_entry["value"]
@@ -168,6 +172,9 @@ class Gatekeeper:
                 valid=value,
                 probability=float(probability),
                 reason=reason,
+                model=model_name,
+                raw_response=raw_resp,
+                usage=usage,
             )
 
         # Format 2: Real TypeSafe System One response with 'noul' probability
@@ -182,6 +189,9 @@ class Gatekeeper:
                 valid=is_valid,
                 probability=prob_float,
                 reason=reason,
+                model=model_name,
+                raw_response=raw_resp,
+                usage=usage,
             )
 
         raise ValueError(f"Malformed response schema: missing required fields in {valid_entry}")

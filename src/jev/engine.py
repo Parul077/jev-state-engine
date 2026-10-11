@@ -1,7 +1,9 @@
+import hashlib
 import inspect
 import json
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -25,8 +27,90 @@ from langgraph.checkpoint.base import (
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from jev.ledger import NullRecorder, Recorder
 from jev.models import State, Subgoal, TestOutcome
 from jev.workspace import MainDivergedError, TrackedModificationsError, Workspace
+
+
+class SafeRecorder(NullRecorder):
+    """Fail-safe proxy wrapper around a Recorder.
+
+    Recording must never change a run's outcome. Wrap every ledger call.
+    On any error, log one warning per run ("ledger disabled for this run: <error>") and continue.
+    """
+
+    def __init__(self, target: Any):
+        self.target = target
+        self.disabled = False
+
+    def _call(self, name: str, *args: Any, **kwargs: Any) -> Any:
+        if self.disabled or self.target is None:
+            return None
+        try:
+            fn = getattr(self.target, name, None)
+            if fn:
+                return fn(*args, **kwargs)
+        except Exception as exc:
+            self.disabled = True
+            msg = f"ledger disabled for this run: {exc}"
+            print(f"WARNING: {msg}", file=sys.stderr, flush=True)
+            print(f"WARNING: {msg}", flush=True)
+            return None
+
+    def record_run_start(self, *args: Any, **kwargs: Any) -> None:
+        self._call("record_run_start", *args, **kwargs)
+
+    def record_run_end(self, *args: Any, **kwargs: Any) -> None:
+        self._call("record_run_end", *args, **kwargs)
+
+    def record_subgoals(self, *args: Any, **kwargs: Any) -> None:
+        self._call("record_subgoals", *args, **kwargs)
+
+    def record_subgoal_committed(self, *args: Any, **kwargs: Any) -> None:
+        self._call("record_subgoal_committed", *args, **kwargs)
+
+    def record_subgoal_status(self, *args: Any, **kwargs: Any) -> None:
+        self._call("record_subgoal_status", *args, **kwargs)
+
+    def record_attempt(self, *args: Any, **kwargs: Any) -> None:
+        self._call("record_attempt", *args, **kwargs)
+
+    def has_run(self, *args: Any, **kwargs: Any) -> bool:
+        res = self._call("has_run", *args, **kwargs)
+        return bool(res)
+
+
+def _get_engine_commit() -> Optional[str]:
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return res.stdout.strip()
+    except Exception:
+        return None
+
+
+def _normalize_compile_errors(compile_info: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not compile_info or not isinstance(compile_info, dict):
+        return []
+    new_errors = compile_info.get("new_errors") or []
+    if not new_errors:
+        return []
+    normalized: List[Dict[str, Any]] = []
+    try:
+        diag_objs = Workspace.parse_diagnostics("\n".join(str(e) for e in new_errors))
+        for d in diag_objs:
+            normalized.append({"file": d.file, "code": d.code, "message": d.message})
+    except Exception:
+        pass
+    if not normalized:
+        for err in new_errors:
+            normalized.append({"file": "", "code": "", "message": str(err)})
+    return normalized
 
 
 
@@ -1184,6 +1268,7 @@ def node_plan(
     workspace: Optional[Any] = None,
     llm: Optional[Any] = None,
     gatekeeper: Optional[Any] = None,
+    recorder: Optional[Any] = None,
 ) -> State:
     """State 2: PLANNING (Generates structured Subgoals with declared scope).
 
@@ -1207,20 +1292,34 @@ def node_plan(
             ticket = state.get("ticket", "Default task")
             plan_queue = [
                 Subgoal(
+                    id="sg-1",
                     description=ticket,
                     scope=[],
                     expects_tests=True,
+                    status="pending",
                 )
             ]
             state["plan_queue"] = plan_queue
         else:
             normalized_queue: List[Subgoal] = []
-            for item in plan_queue:
+            for idx, item in enumerate(plan_queue):
                 if isinstance(item, dict):
-                    normalized_queue.append(Subgoal(**item))
+                    sg = Subgoal(**item)
                 elif isinstance(item, Subgoal):
-                    normalized_queue.append(item)
+                    sg = item
+                else:
+                    continue
+                if not sg.id:
+                    sg.id = f"sg-{idx + 1}"
+                if not sg.status:
+                    sg.status = "pending"
+                normalized_queue.append(sg)
             state["plan_queue"] = normalized_queue
+
+        if recorder and state.get("plan_queue"):
+            safe_rec = recorder if isinstance(recorder, SafeRecorder) else SafeRecorder(recorder)
+            run_id = state.get("run_id") or state.get("thread_id") or "unknown"
+            safe_rec.record_subgoals(run_id, state["plan_queue"])
 
         state["current_subgoal"] = None
         state["last_feedback"] = None
@@ -1344,7 +1443,18 @@ def node_plan(
                 messages.append(HumanMessage(content=retry_prompt))
 
     if subgoals is not None:
+        for idx, sg in enumerate(subgoals):
+            if not sg.id:
+                sg.id = f"sg-{idx + 1}"
+            if not sg.status:
+                sg.status = "pending"
         state["plan_queue"] = subgoals
+
+        if recorder and state.get("plan_queue"):
+            safe_rec = recorder if isinstance(recorder, SafeRecorder) else SafeRecorder(recorder)
+            run_id = state.get("run_id") or state.get("thread_id") or "unknown"
+            safe_rec.record_subgoals(run_id, state["plan_queue"])
+
         state["current_subgoal"] = None
         state["last_feedback"] = None
         state["gate_status"] = None
@@ -1437,6 +1547,13 @@ def node_implement(
         subgoal = Subgoal(**current_subgoal)
     elif isinstance(current_subgoal, Subgoal):
         subgoal = current_subgoal
+
+    if subgoal is not None:
+        subgoal.status = "in_progress"
+        state["current_subgoal"] = subgoal
+
+    state["worker_tokens_in"] = None
+    state["worker_tokens_out"] = None
 
     if workspace is not None and hasattr(workspace, "create_subgoal_worktree") and subgoal is not None:
         if not state.get("current_worktree_path"):
@@ -1636,6 +1753,15 @@ def node_implement(
 
             messages.append(response)
 
+            usage_meta = getattr(response, "usage_metadata", None)
+            if isinstance(usage_meta, dict):
+                in_t = usage_meta.get("input_tokens")
+                out_t = usage_meta.get("output_tokens")
+                if in_t is not None:
+                    state["worker_tokens_in"] = (state.get("worker_tokens_in") or 0) + in_t
+                if out_t is not None:
+                    state["worker_tokens_out"] = (state.get("worker_tokens_out") or 0) + out_t
+
             tool_calls = getattr(response, "tool_calls", None)
             if not tool_calls and isinstance(response, dict):
                 tool_calls = response.get("tool_calls")
@@ -1657,16 +1783,24 @@ def node_implement(
                 if name == "submit_subgoal":
                     submitted = True
                     result = "Subgoal submitted."
+                    stored_args = args
                 elif name in ("stage_file_mutation", "write_file"):
                     actual_path = args.get("path") or args.get("file_path") or args.get("filename") or ""
                     actual_content = args.get("content")
                     if actual_content is None:
                         actual_content = args.get("code", args.get("text", ""))
                     result = _execute_stage_file_mutation(actual_path, str(actual_content))
+                    c_str = str(actual_content)
+                    stored_args = {
+                        "path": actual_path,
+                        "content_sha": hashlib.sha256(c_str.encode("utf-8")).hexdigest(),
+                        "content_chars": len(c_str),
+                    }
                 else:
                     result = f"Unknown tool: {name}. Available tools: stage_file_mutation, submit_subgoal."
+                    stored_args = args
 
-                executed_tools.append({"name": name, "args": args, "result": str(result)[:200]})
+                executed_tools.append({"name": name, "args": stored_args, "result": str(result)[:200]})
 
                 messages.append(
                     ToolMessage(
@@ -1779,10 +1913,93 @@ def _format_compile_feedback(
     return "\n".join(out_lines)
 
 
+def _teardown_worktree(state: State, workspace: Optional[Any]) -> None:
+    """Helper to tear down active worktree and restore workspace repo_dir."""
+    if workspace is not None:
+        is_wt = _is_active_worktree(state, workspace)
+        wt_path, wt_branch = _get_active_worktree_info(state, workspace)
+        if is_wt and hasattr(workspace, "discard_subgoal_worktree"):
+            workspace.discard_subgoal_worktree(wt_path, wt_branch)
+        elif hasattr(workspace, "rollback_subgoal"):
+            workspace.rollback_subgoal()
+        if hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
+            workspace.worktree_dir = workspace.repo_dir
+    state["current_worktree_path"] = None
+    state["current_worktree_branch"] = None
+
+
+def _snapshot_attempt(
+    recorder: Optional[Any],
+    state: State,
+    subgoal_id: str,
+    tier: str,
+    outcome: str,
+    failed_check: Optional[str] = None,
+    diff: str = "",
+    compile_info: Optional[Dict[str, Any]] = None,
+    tests_ran: bool = False,
+    test_outcome: Optional[str] = None,
+    verdict: Optional[Any] = None,
+    feedback_sent: Optional[str] = None,
+) -> None:
+    """Helper to snapshot an attempt row to the ledger."""
+    if not recorder:
+        return
+    safe_rec = recorder if isinstance(recorder, SafeRecorder) else SafeRecorder(recorder)
+    run_id = state.get("run_id") or state.get("thread_id") or "unknown"
+    diff_sha = hashlib.sha256(diff.encode("utf-8")).hexdigest() if diff else hashlib.sha256(b"").hexdigest()
+    files: List[str] = []
+    if diff:
+        try:
+            files = sorted(list(Workspace._extract_files_from_diff(diff)))
+        except Exception:
+            files = []
+    norm_errors = _normalize_compile_errors(compile_info)
+    jev_valid = getattr(verdict, "valid", None) if verdict else None
+    jev_prob = getattr(verdict, "probability", None) if verdict else None
+    jev_model = getattr(verdict, "model", None) if verdict else None
+    jev_raw = None
+    if verdict and getattr(verdict, "raw_response", None):
+        try:
+            jev_raw = json.dumps(verdict.raw_response)
+        except Exception:
+            jev_raw = str(verdict.raw_response)
+    jev_usage = getattr(verdict, "usage", None) if verdict else None
+    jev_tokens_in = None
+    jev_tokens_out = None
+    if isinstance(jev_usage, dict):
+        jev_tokens_in = jev_usage.get("tokens_in") or jev_usage.get("prompt_tokens") or jev_usage.get("input_tokens")
+        jev_tokens_out = jev_usage.get("tokens_out") or jev_usage.get("completion_tokens") or jev_usage.get("output_tokens")
+
+    safe_rec.record_attempt(
+        run_id=run_id,
+        subgoal_id=subgoal_id,
+        tier=tier,
+        outcome=outcome,
+        failed_check=failed_check,
+        diff=diff,
+        diff_sha=diff_sha,
+        files=files,
+        compile_errors=norm_errors if norm_errors else None,
+        tests_ran=tests_ran,
+        test_outcome=test_outcome,
+        jev_valid=jev_valid,
+        jev_probability=jev_prob,
+        jev_model=jev_model,
+        jev_raw=jev_raw,
+        jev_tokens_in=jev_tokens_in,
+        jev_tokens_out=jev_tokens_out,
+        feedback_sent=feedback_sent,
+        tokens_in=state.get("worker_tokens_in"),
+        tokens_out=state.get("worker_tokens_out"),
+    )
+
+
 def node_gate(
     state: State,
     workspace: Optional[Any] = None,
     gatekeeper: Optional[Any] = None,
+    recorder: Optional[Any] = None,
 ) -> State:
     """The Two-Tier Gate Router.
 
@@ -1813,6 +2030,12 @@ def node_gate(
         subgoal = subgoal_raw
     else:
         subgoal = Subgoal()
+
+    safe_rec = SafeRecorder(recorder) if recorder and not isinstance(recorder, SafeRecorder) else recorder
+    run_id = state.get("run_id") or state.get("thread_id") or "unknown"
+    subgoal_id = getattr(subgoal, "id", None) or "sg-1"
+
+    diff = workspace.get_staged_diff() if hasattr(workspace, "get_staged_diff") else ""
 
     # Tier 0: Mechanical checks
     subgoal_base_commit = state.get("subgoal_base_commit")
@@ -1886,24 +2109,29 @@ def node_gate(
         }
 
     if not mech_result.passed:
-        is_wt = _is_active_worktree(state, workspace)
-        wt_path, wt_branch = _get_active_worktree_info(state, workspace)
-        if is_wt and hasattr(workspace, "discard_subgoal_worktree"):
-            workspace.discard_subgoal_worktree(
-                wt_path,
-                wt_branch,
-            )
-        elif hasattr(workspace, "rollback_subgoal"):
-            workspace.rollback_subgoal()
-        if hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
-            workspace.worktree_dir = workspace.repo_dir
-        state["current_worktree_path"] = None
-        state["current_worktree_branch"] = None
-
         if mech_result.failed_check in ("no_compile_command", "env_not_ready"):
             state["status"] = "escalated"
             state["gate_status"] = mech_result.failed_check
             state["last_feedback"] = mech_result.detail
+
+            _snapshot_attempt(
+                safe_rec,
+                state,
+                subgoal_id,
+                tier="mechanical",
+                outcome=mech_result.failed_check,
+                failed_check=mech_result.failed_check,
+                diff=diff,
+                compile_info=compile_telemetry,
+                tests_ran=tests_ran,
+                test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+                feedback_sent=mech_result.detail,
+            )
+            _teardown_worktree(state, workspace)
+            subgoal.status = "failed"
+            state["current_subgoal"] = subgoal
+            if safe_rec:
+                safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
 
             state["trajectory"].append({
                 "node": "gate",
@@ -1936,6 +2164,21 @@ def node_gate(
         else:
             state["last_feedback"] = mech_result.detail
 
+        _snapshot_attempt(
+            safe_rec,
+            state,
+            subgoal_id,
+            tier="mechanical",
+            outcome="mechanical_failure",
+            failed_check=mech_result.failed_check,
+            diff=diff,
+            compile_info=compile_telemetry,
+            tests_ran=tests_ran,
+            test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+            feedback_sent=state.get("last_feedback"),
+        )
+        _teardown_worktree(state, workspace)
+
         state["trajectory"].append({
             "node": "gate",
             "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
@@ -1948,6 +2191,10 @@ def node_gate(
         })
 
         if current_mech_strikes >= 3:
+            subgoal.status = "failed"
+            state["current_subgoal"] = subgoal
+            if safe_rec:
+                safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
             _safe_escalate_deadlock(
                 gatekeeper,
                 trajectory=state.get("trajectory", []),
@@ -1961,7 +2208,6 @@ def node_gate(
     if gatekeeper is None:
         raise ValueError("Gatekeeper must be provided for Tier 1 validation.")
 
-    diff = workspace.get_staged_diff()
     inv_notes = state.get("investigation_notes")
     if _accepts_param(gatekeeper.validate_subgoal, "investigation_notes"):
         verdict = gatekeeper.validate_subgoal(
@@ -1988,6 +2234,9 @@ def node_gate(
         wt_branch = state.get("current_worktree_branch")
         is_worktree_active = _is_active_worktree(state, workspace)
 
+        parent_sha: Optional[str] = None
+        commit_sha: Optional[str] = None
+
         if wt_path and hasattr(workspace, "merge_subgoal_worktree"):
             target_branch = state.get("integration_branch")
             if not target_branch:
@@ -1995,6 +2244,15 @@ def node_gate(
                 state["status"] = "escalated"
                 err_msg = "Worktree merge failed: integration_branch is missing from state"
                 state["last_feedback"] = err_msg
+                _snapshot_attempt(
+                    safe_rec, state, subgoal_id, tier="merge", outcome="merge_failed",
+                    diff=diff, feedback_sent=err_msg
+                )
+                _teardown_worktree(state, workspace)
+                subgoal.status = "failed"
+                state["current_subgoal"] = subgoal
+                if safe_rec:
+                    safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
                 state["trajectory"].append({
                     "node": "gate",
                     "error_type": "missing_integration_branch",
@@ -2008,16 +2266,35 @@ def node_gate(
                     thread_id=state.get("thread_id"),
                 )
                 return state
+            if hasattr(workspace, "get_branch_commit"):
+                try:
+                    parent_sha = workspace.get_branch_commit(target_branch)
+                except Exception:
+                    parent_sha = None
             try:
                 workspace.merge_subgoal_worktree(
                     wt_path,
                     wt_branch,
                     target_branch=target_branch,
                 )
+                if hasattr(workspace, "get_branch_commit"):
+                    try:
+                        commit_sha = workspace.get_branch_commit(target_branch)
+                    except Exception:
+                        commit_sha = None
             except Exception as e:
                 state["gate_status"] = "merge_failed"
                 state["status"] = "escalated"
                 state["last_feedback"] = f"Worktree merge failed: {e}"
+                _snapshot_attempt(
+                    safe_rec, state, subgoal_id, tier="merge", outcome="merge_failed",
+                    diff=diff, feedback_sent=str(e)
+                )
+                _teardown_worktree(state, workspace)
+                subgoal.status = "failed"
+                state["current_subgoal"] = subgoal
+                if safe_rec:
+                    safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
                 state["trajectory"].append({
                     "node": "gate",
                     "error_type": "merge_failure",
@@ -2033,18 +2310,18 @@ def node_gate(
                 )
                 return state
         elif is_worktree_active:
-            # An active worktree was created, but worktree state is missing from state or merge method missing!
-            # Fail loudly and escalate instead of committing quietly on the worktree branch.
-            active_wt_path, active_wt_branch = _get_active_worktree_info(state, workspace)
-            if hasattr(workspace, "discard_subgoal_worktree"):
-                workspace.discard_subgoal_worktree(active_wt_path, active_wt_branch)
-            if hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
-                workspace.worktree_dir = workspace.repo_dir
-            state["current_worktree_path"] = None
-            state["current_worktree_branch"] = None
+            err_msg = "Worktree was created but worktree state was missing or invalid at gate time."
+            _snapshot_attempt(
+                safe_rec, state, subgoal_id, tier="worktree", outcome="worktree_state_missing",
+                diff=diff, feedback_sent=err_msg
+            )
+            _teardown_worktree(state, workspace)
+            subgoal.status = "failed"
+            state["current_subgoal"] = subgoal
+            if safe_rec:
+                safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
             state["gate_status"] = "merge_failed"
             state["status"] = "escalated"
-            err_msg = "Worktree was created but worktree state was missing or invalid at gate time."
             state["last_feedback"] = err_msg
             state["trajectory"].append({
                 "node": "gate",
@@ -2061,7 +2338,13 @@ def node_gate(
             )
             return state
         elif hasattr(workspace, "commit_subgoal"):
+            if hasattr(workspace, "base_commit"):
+                parent_sha = workspace.base_commit
+            elif hasattr(workspace, "_get_head_commit"):
+                parent_sha = workspace._get_head_commit()
             workspace.commit_subgoal()
+            if hasattr(workspace, "_get_head_commit"):
+                commit_sha = workspace._get_head_commit()
 
         state["current_worktree_path"] = None
         state["current_worktree_branch"] = None
@@ -2069,6 +2352,24 @@ def node_gate(
         state["semantic_strike_count"] = 0
         state["gate_status"] = "passed"
         state["last_feedback"] = ""
+        subgoal.status = "committed"
+        state["current_subgoal"] = subgoal
+
+        _snapshot_attempt(
+            safe_rec,
+            state,
+            subgoal_id,
+            tier="semantic",
+            outcome="passed",
+            diff=diff,
+            verdict=verdict,
+            tests_ran=tests_ran,
+            test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+            feedback_sent="",
+        )
+        if safe_rec:
+            safe_rec.record_subgoal_committed(run_id, subgoal_id, parent_sha=parent_sha, commit_sha=commit_sha)
+
         state["trajectory"].append({
             "node": "gate",
             "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
@@ -2081,23 +2382,10 @@ def node_gate(
         })
         return state
     else:
-        is_wt = _is_active_worktree(state, workspace)
-        wt_path, wt_branch = _get_active_worktree_info(state, workspace)
-        if is_wt and hasattr(workspace, "discard_subgoal_worktree"):
-            workspace.discard_subgoal_worktree(
-                wt_path,
-                wt_branch,
-            )
-        elif hasattr(workspace, "rollback_subgoal"):
-            workspace.rollback_subgoal()
-        if hasattr(workspace, "repo_dir") and isinstance(workspace.repo_dir, Path):
-            workspace.worktree_dir = workspace.repo_dir
-        state["current_worktree_path"] = None
-        state["current_worktree_branch"] = None
+        prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
         current_sem_strikes = state.get("semantic_strike_count", 0) + 1
         state["semantic_strike_count"] = current_sem_strikes
         state["gate_status"] = "semantic_failure"
-        prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
         state["last_feedback"] = (
             verdict.reason
             or f"Semantic validation rejected by Gatekeeper{prob_str}. "
@@ -2105,6 +2393,26 @@ def node_gate(
                "Ensure changes match the project architecture, dependencies, and styling in Investigation Notes. "
                "Ensure changes strictly adhere to the application's actual domain, product identity, and branding documented in Investigation Notes, without introducing conflicting domain concepts, alternate sports/business models, or fabricated external entities."
         )
+
+        _snapshot_attempt(
+            safe_rec,
+            state,
+            subgoal_id,
+            tier="semantic",
+            outcome="semantic_failure",
+            diff=diff,
+            verdict=verdict,
+            tests_ran=tests_ran,
+            test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
+            feedback_sent=state.get("last_feedback"),
+        )
+        _teardown_worktree(state, workspace)
+
+        if current_sem_strikes >= 3:
+            subgoal.status = "failed"
+            state["current_subgoal"] = subgoal
+            if safe_rec:
+                safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
 
         state["trajectory"].append({
             "node": "gate",
@@ -2133,8 +2441,10 @@ def node_verify(
     state: State,
     workspace: Optional[Any] = None,
     gatekeeper: Optional[Any] = None,
+    recorder: Optional[Any] = None,
 ) -> State:
     """State 4: VERIFICATION (Executes full test suite and final ticket verification on a dedicated verify worktree)."""
+    safe_rec = SafeRecorder(recorder) if recorder and not isinstance(recorder, SafeRecorder) else recorder
     if "trajectory" not in state or state["trajectory"] is None:
         state["trajectory"] = []
 
@@ -2172,6 +2482,18 @@ def node_verify(
             state["gate_status"] = "verification_failed"
             state["status"] = "escalated" if compile_info.get("outcome") in ("NO_COMPILE_COMMAND", "ENV_NOT_READY") else "verification_failed"
             state["last_feedback"] = f"Final compile check failed: {compile_info.get('detail')}"
+            _snapshot_attempt(
+                safe_rec,
+                state,
+                subgoal_id="__verify__",
+                tier="mechanical",
+                outcome="mechanical_failure" if compile_info.get("outcome") == "FAILED" else compile_info.get("outcome", "").lower(),
+                failed_check=compile_info.get("outcome"),
+                diff=final_diff,
+                compile_info=compile_info,
+                tests_ran=False,
+                feedback_sent=state.get("last_feedback"),
+            )
             verify_entry = {
                 "node": "verify",
                 "gate_status": "verification_failed",
@@ -2215,6 +2537,19 @@ def node_verify(
             state["gate_status"] = "verification_failed"
             state["status"] = "escalated"
             state["last_feedback"] = f"Final test check failed: Environment not ready: {err_detail}"
+            _snapshot_attempt(
+                safe_rec,
+                state,
+                subgoal_id="__verify__",
+                tier="mechanical",
+                outcome="env_not_ready",
+                failed_check="env_not_ready",
+                diff=final_diff,
+                compile_info=compile_info,
+                tests_ran=tests_ran,
+                test_outcome="ENV_NOT_READY",
+                feedback_sent=state.get("last_feedback"),
+            )
             verify_entry = {
                 "node": "verify",
                 "gate_status": "verification_failed",
@@ -2306,11 +2641,37 @@ def node_verify(
                 state["gate_status"] = "verified"
                 state["status"] = "completed"
                 state["last_feedback"] = ""
+                _snapshot_attempt(
+                    safe_rec,
+                    state,
+                    subgoal_id="__verify__",
+                    tier="semantic",
+                    outcome="passed",
+                    diff=final_diff,
+                    compile_info=compile_info,
+                    tests_ran=tests_ran,
+                    test_outcome=test_runner_info.get("outcome") if isinstance(test_runner_info, dict) else test_output,
+                    verdict=verdict,
+                    feedback_sent="",
+                )
             else:
                 state["gate_status"] = "verification_failed"
                 state["status"] = "verification_failed"
                 prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
                 state["last_feedback"] = verdict.reason or f"Verification rejected by Gatekeeper{prob_str}."
+                _snapshot_attempt(
+                    safe_rec,
+                    state,
+                    subgoal_id="__verify__",
+                    tier="semantic",
+                    outcome="semantic_failure",
+                    diff=final_diff,
+                    compile_info=compile_info,
+                    tests_ran=tests_ran,
+                    test_outcome=test_runner_info.get("outcome") if isinstance(test_runner_info, dict) else test_output,
+                    verdict=verdict,
+                    feedback_sent=state.get("last_feedback"),
+                )
         else:
             if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
                 workspace.discard_verify_worktree(verify_wt_path)
@@ -2321,6 +2682,19 @@ def node_verify(
                 workspace.delete_integration_branch(integration_branch)
             state["gate_status"] = "verified"
             state["status"] = "completed"
+            _snapshot_attempt(
+                safe_rec,
+                state,
+                subgoal_id="__verify__",
+                tier="semantic",
+                outcome="passed",
+                diff=final_diff,
+                compile_info=compile_info,
+                tests_ran=tests_ran,
+                test_outcome=test_runner_info.get("outcome") if isinstance(test_runner_info, dict) else test_output,
+                verdict=None,
+                feedback_sent="",
+            )
 
         verify_entry: Dict[str, Any] = {
             "node": "verify",
@@ -2362,6 +2736,16 @@ def node_verify(
         state["gate_status"] = status_key
         state["status"] = "escalated"
         state["last_feedback"] = str(e)
+        _snapshot_attempt(
+            safe_rec,
+            state,
+            subgoal_id="__verify__",
+            tier="git",
+            outcome=status_key,
+            diff=final_diff,
+            compile_info=compile_info if 'compile_info' in locals() else None,
+            feedback_sent=str(e),
+        )
         state["trajectory"].append({
             "node": "verify",
             "error_type": status_key,
@@ -2390,6 +2774,16 @@ def node_verify(
         state["gate_status"] = "verification_failed"
         state["status"] = "escalated"
         state["last_feedback"] = f"Verification error: {str(e)}"
+        _snapshot_attempt(
+            safe_rec,
+            state,
+            subgoal_id="__verify__",
+            tier="verify",
+            outcome="verification_exception",
+            diff=final_diff,
+            compile_info=compile_info if 'compile_info' in locals() else getattr(workspace, "last_compile_run", None),
+            feedback_sent=f"Verification error: {str(e)}",
+        )
         state["trajectory"].append({
             "node": "verify",
             "error_type": "verification_exception",
@@ -2473,11 +2867,18 @@ class JevEngine:
         db_path: Optional[Union[str, Path]] = "checkpoints.db",
         checkpointer: Optional[BaseCheckpointSaver] = None,
         test_policy: str = "auto",
+        recorder: Optional[Any] = None,
     ):
         self.workspace = workspace
         self.gatekeeper = gatekeeper
         self.llm = llm
         self.test_policy = test_policy
+        if recorder is None:
+            self.recorder = SafeRecorder(NullRecorder())
+        elif isinstance(recorder, SafeRecorder):
+            self.recorder = recorder
+        else:
+            self.recorder = SafeRecorder(recorder)
 
         if checkpointer is not None:
             self.checkpointer = checkpointer
@@ -2492,16 +2893,16 @@ class JevEngine:
         return node_investigate(state, workspace=self.workspace, llm=self.llm)
 
     def _node_plan(self, state: State) -> State:
-        return node_plan(state, workspace=self.workspace, llm=self.llm, gatekeeper=self.gatekeeper)
+        return node_plan(state, workspace=self.workspace, llm=self.llm, gatekeeper=self.gatekeeper, recorder=self.recorder)
 
     def _node_implement(self, state: State) -> State:
         return node_implement(state, workspace=self.workspace, llm=self.llm)
 
     def node_gate(self, state: State) -> State:
-        return node_gate(state, workspace=self.workspace, gatekeeper=self.gatekeeper)
+        return node_gate(state, workspace=self.workspace, gatekeeper=self.gatekeeper, recorder=self.recorder)
 
     def _node_verify(self, state: State) -> State:
-        return node_verify(state, workspace=self.workspace, gatekeeper=self.gatekeeper)
+        return node_verify(state, workspace=self.workspace, gatekeeper=self.gatekeeper, recorder=self.recorder)
 
     def _node_escalate(self, state: State) -> State:
         return node_escalate(state, workspace=self.workspace, gatekeeper=self.gatekeeper)
@@ -2570,6 +2971,10 @@ class JevEngine:
             rnd = uuid.uuid4().hex[:4]
             thread_id = f"run-{ts}-{rnd}"
 
+        run_id = thread_id
+        if self.recorder.has_run(run_id):
+            run_id = f"{thread_id}_{uuid.uuid4().hex[:6]}"
+
         base_commit = None
         if self.workspace is not None:
             if hasattr(self.workspace, "base_commit") and self.workspace.base_commit:
@@ -2608,9 +3013,27 @@ class JevEngine:
         if self.workspace is not None and hasattr(self.workspace, "create_integration_branch"):
             self.workspace.create_integration_branch(integration_branch, base_commit=base_commit)
 
+        worker_model = None
+        if self.llm is not None:
+            worker_model = getattr(self.llm, "model", None) or getattr(self.llm, "model_name", None)
+            if not worker_model and hasattr(self.llm, "__class__"):
+                worker_model = self.llm.__class__.__name__
+
+        engine_commit = _get_engine_commit()
+        self.recorder.record_run_start(
+            run_id=run_id,
+            thread_id=thread_id,
+            ticket=ticket,
+            base_commit=base_commit,
+            engine_commit=engine_commit,
+            worker_model=worker_model,
+            test_policy=self.test_policy,
+        )
+
         initial_state: State = {
             "ticket": ticket,
             "thread_id": thread_id,
+            "run_id": run_id,
             "base_commit": base_commit,
             "integration_branch": integration_branch,
             "subgoal_base_commit": base_commit,
@@ -2626,4 +3049,27 @@ class JevEngine:
         }
 
         config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
-        return self.app.invoke(initial_state, config=config)
+        final_state = self.app.invoke(initial_state, config=config)
+
+        final_status = final_state.get("status") or "unknown"
+        final_commit = None
+        if self.workspace is not None:
+            if hasattr(self.workspace, "_get_head_commit"):
+                try:
+                    final_commit = self.workspace._get_head_commit()
+                except Exception:
+                    pass
+            if not final_commit and hasattr(self.workspace, "base_commit"):
+                final_commit = self.workspace.base_commit
+
+        inv_notes = final_state.get("investigation_notes") or ""
+        notes_chars = len(inv_notes)
+
+        self.recorder.record_run_end(
+            run_id=run_id,
+            final_status=final_status,
+            final_commit=final_commit,
+            notes_chars=notes_chars,
+        )
+
+        return final_state

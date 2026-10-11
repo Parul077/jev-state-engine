@@ -29,9 +29,11 @@ class TestPolicy(str, Enum):
 
 
 class Subgoal(BaseModel):
+    id: str = ""
     description: str = ""
     scope: List[str] = Field(default_factory=list)
     expects_tests: bool = True
+    status: str = "pending"
 
 
 class MechanicalCheckResult(BaseModel):
@@ -48,6 +50,9 @@ class ValidationVerdict(BaseModel):
     valid: bool
     probability: float = 1.0
     reason: Optional[str] = None
+    model: Optional[str] = None
+    raw_response: Optional[Dict[str, Any]] = None
+    usage: Optional[Dict[str, Any]] = None
 
 
 class State(TypedDict, total=False):
@@ -70,5 +75,8 @@ class State(TypedDict, total=False):
     integration_branch: Optional[str]
     subgoal_base_commit: Optional[str]
     test_policy: Optional[str]
+    run_id: Optional[str]
+    worker_tokens_in: Optional[int]
+    worker_tokens_out: Optional[int]
 
 

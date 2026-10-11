@@ -8,6 +8,7 @@ from dotenv import dotenv_values
 
 from jev.engine import JevEngine
 from jev.gatekeeper import Gatekeeper
+from jev.ledger import NullRecorder, SqliteLedger
 from jev.workspace import Workspace
 
 
@@ -55,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Execution policy for repository test suites (auto, verify-only, never, always; defaults to auto)",
     )
+    parser.add_argument(
+        "--no-ledger",
+        action="store_true",
+        default=False,
+        help="Disable recording to SQLite ledger",
+    )
     return parser
 
 
@@ -71,6 +78,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         engine_env = Path(__file__).resolve().parent.parent / ".env"
     env_file = engine_env if engine_env.exists() else ((repo_dir / ".env") if (repo_dir / ".env").exists() else None)
     gatekeeper = Gatekeeper(env_file=env_file)
+
+    if args.no_ledger:
+        recorder = NullRecorder()
+    else:
+        recorder = SqliteLedger(repo_dir=repo_dir)
 
     # Wire Gemini LLM (gemini-3.5-flash-lite) via langchain-google-genai
     google_api_key = os.environ.get("GOOGLE_API_KEY")
@@ -96,6 +108,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         workspace=workspace,
         gatekeeper=gatekeeper,
         llm=llm,
+        recorder=recorder,
         db_path=args.db_path,
         test_policy=args.test_policy,
     )
