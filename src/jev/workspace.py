@@ -55,6 +55,17 @@ class BuildCheckResult(BaseModel):
         return self.passed
 
 
+class SuppressionCheckResult(BaseModel):
+    passed: bool
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.passed
+
+    def __iter__(self):
+        return iter((self.passed, self.detail))
+
+
 class ScopeCheckResult(BaseModel):
     passed: bool
     out_of_scope: List[str] = Field(default_factory=list)
@@ -85,6 +96,22 @@ ALL_SOURCE_EXTENSIONS = {
     ".rs",
     ".java", ".kt",
     ".py",
+}
+
+SUPPRESSION_DIRECTIVES: Dict[str, List[str]] = {
+    ".ts": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".tsx": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".js": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".jsx": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".mjs": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".cjs": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".py": ["# type: ignore", "# mypy: ignore-errors", "# pyright: ignore"],
+    ".pyi": ["# type: ignore", "# mypy: ignore-errors", "# pyright: ignore"],
+    ".go": [],
+    ".rs": [],
+    ".java": [],
+    ".kt": [],
+    ".kts": [],
 }
 
 
@@ -360,6 +387,8 @@ ECOSYSTEM_COMPILE_HANDLERS = [
 
 
 class Workspace:
+    SUPPRESSION_DIRECTIVES = SUPPRESSION_DIRECTIVES
+
     def __init__(
         self,
         repo_dir: Optional[Union[str, Path]] = None,
@@ -1324,6 +1353,76 @@ class Workspace:
                         touched.add(cls._clean_diff_path(p_b))
         return touched
 
+    def check_suppression(self, diff: Optional[str] = None) -> SuppressionCheckResult:
+        """Scans only the added lines of the staged diff for compiler or type-check suppression directives."""
+        if diff is None:
+            diff = self.get_staged_diff()
+
+        if not diff or not diff.strip():
+            return SuppressionCheckResult(passed=True, detail="")
+
+        current_file: Optional[str] = None
+        current_directives: List[str] = []
+        current_line_num: int = 0
+
+        hunk_header_re = re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
+
+        for raw_line in diff.splitlines():
+            if raw_line.startswith("diff --git "):
+                current_file = None
+                current_directives = []
+                current_line_num = 0
+                continue
+
+            if raw_line.startswith("+++ "):
+                target = raw_line[4:].strip()
+                if target.startswith("b/"):
+                    target = target[2:]
+                if target == "/dev/null":
+                    current_file = None
+                    current_directives = []
+                else:
+                    target = self._clean_diff_path(target)
+                    current_file = target
+                    ext = Path(target).suffix.lower()
+                    current_directives = self.SUPPRESSION_DIRECTIVES.get(ext, [])
+                continue
+
+            if current_file is None or not current_directives:
+                continue
+
+            m = hunk_header_re.match(raw_line)
+            if m:
+                current_line_num = int(m.group(1))
+                continue
+
+            if raw_line.startswith("+") and not raw_line.startswith("+++"):
+                added_content = raw_line[1:]
+                for directive in current_directives:
+                    matched = False
+                    if directive in added_content:
+                        matched = True
+                    elif directive.startswith("#"):
+                        norm_dir = directive.replace(" ", "")
+                        norm_line = added_content.replace(" ", "")
+                        if norm_dir in norm_line:
+                            matched = True
+
+                    if matched:
+                        detail = (
+                            f"Compiler/type-check suppression directive '{directive}' found in {current_file} "
+                            f"at line {current_line_num}: '{added_content.strip()}'. "
+                            f"Do not suppress compiler errors. Fix the cause, or escalate if it cannot be fixed."
+                        )
+                        return SuppressionCheckResult(passed=False, detail=detail)
+                current_line_num += 1
+            elif raw_line.startswith(" "):
+                current_line_num += 1
+            elif raw_line.startswith("-") and not raw_line.startswith("---"):
+                pass
+
+        return SuppressionCheckResult(passed=True, detail="")
+
     def check_scope(
         self,
         diff: Optional[Union[str, List[str]]] = None,
@@ -2024,6 +2123,7 @@ class Workspace:
                 checks_run=["build"],
                 checks={
                     "build": {"ran": True, "passed": False, "detail": build_res.detail},
+                    "suppression": {"ran": False, "passed": None},
                     "compile": {"ran": False, "passed": None},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
@@ -2032,8 +2132,27 @@ class Workspace:
                 test_runner_outcome=None,
             )
 
-        # 2. check_compile
+        # 2. check_suppression
         diff = self.get_staged_diff()
+        suppression_res = self.check_suppression(diff=diff)
+        if not suppression_res.passed:
+            return MechanicalCheckResult(
+                passed=False,
+                failed_check="suppression",
+                detail=suppression_res.detail,
+                checks_run=["build", "suppression"],
+                checks={
+                    "build": {"ran": True, "passed": True, "detail": ""},
+                    "suppression": {"ran": True, "passed": False, "detail": suppression_res.detail},
+                    "compile": {"ran": False, "passed": None},
+                    "tests": {"ran": False, "passed": None},
+                    "scope": {"ran": False, "passed": None},
+                },
+                compile_outcome=None,
+                test_runner_outcome=None,
+            )
+
+        # 3. check_compile
         compile_res = self.check_compile(diff=diff, scope=subgoal.scope, base_commit=base_commit)
         compile_outcome = compile_res.get("outcome")
 
@@ -2042,9 +2161,10 @@ class Workspace:
                 passed=False,
                 failed_check="compile",
                 detail=compile_res.get("detail", "Compile check failed."),
-                checks_run=["build", "compile"],
+                checks_run=["build", "suppression", "compile"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
+                    "suppression": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
@@ -2057,9 +2177,10 @@ class Workspace:
                 passed=False,
                 failed_check="no_compile_command",
                 detail=compile_res.get("detail", "No compile command found."),
-                checks_run=["build", "compile"],
+                checks_run=["build", "suppression", "compile"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
+                    "suppression": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
@@ -2072,9 +2193,10 @@ class Workspace:
                 passed=False,
                 failed_check="env_not_ready",
                 detail=compile_res.get("detail", "Environment not ready."),
-                checks_run=["build", "compile"],
+                checks_run=["build", "suppression", "compile"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
+                    "suppression": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
@@ -2083,7 +2205,7 @@ class Workspace:
                 test_runner_outcome=None,
             )
 
-        # 3. run_tests
+        # 4. run_tests
         should_run_tests = False
         if test_policy == "always":
             should_run_tests = True
@@ -2116,9 +2238,10 @@ class Workspace:
                 passed=False,
                 failed_check="env_not_ready",
                 detail=f"Environment not ready: {err_detail}",
-                checks_run=["build", "compile", "tests"],
+                checks_run=["build", "suppression", "compile", "tests"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
+                    "suppression": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": True, "passed": False, "detail": f"Environment not ready: {err_detail}"},
                     "scope": {"ran": False, "passed": None},
@@ -2131,9 +2254,10 @@ class Workspace:
                 passed=False,
                 failed_check="tests",
                 detail="Unit tests failed.",
-                checks_run=["build", "compile", "tests"],
+                checks_run=["build", "suppression", "compile", "tests"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
+                    "suppression": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": True, "passed": False, "detail": "Unit tests failed."},
                     "scope": {"ran": False, "passed": None},
@@ -2149,9 +2273,10 @@ class Workspace:
                         passed=False,
                         failed_check="no_tests_collected",
                         detail=detail_msg,
-                        checks_run=["build", "compile", "tests"],
+                        checks_run=["build", "suppression", "compile", "tests"],
                         checks={
                             "build": {"ran": True, "passed": True, "detail": ""},
+                            "suppression": {"ran": True, "passed": True, "detail": ""},
                             "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                             "tests": {"ran": True, "passed": False, "detail": detail_msg},
                             "scope": {"ran": False, "passed": None},
@@ -2162,16 +2287,17 @@ class Workspace:
         elif test_outcome == TestOutcome.NO_TEST_FRAMEWORK:
             pass
 
-        # 4. check_scope
+        # 5. check_scope
         scope_res = self.check_scope(diff, subgoal.scope)
         if not scope_res.passed:
             return MechanicalCheckResult(
                 passed=False,
                 failed_check="scope",
                 detail=scope_res.detail,
-                checks_run=["build", "compile", "tests", "scope"] if should_run_tests else ["build", "compile", "scope"],
+                checks_run=["build", "suppression", "compile", "tests", "scope"] if should_run_tests else ["build", "suppression", "compile", "scope"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
+                    "suppression": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": should_run_tests, "passed": True, "detail": "" if should_run_tests else f"Skipped per test policy: {test_policy}"},
                     "scope": {"ran": True, "passed": False, "detail": scope_res.detail},
@@ -2201,9 +2327,10 @@ class Workspace:
             passed=True,
             failed_check=None,
             detail=untested_flag,
-            checks_run=["build", "compile", "tests", "scope"] if should_run_tests else ["build", "compile", "scope"],
+            checks_run=["build", "suppression", "compile", "tests", "scope"] if should_run_tests else ["build", "suppression", "compile", "scope"],
             checks={
                 "build": {"ran": True, "passed": True, "detail": ""},
+                "suppression": {"ran": True, "passed": True, "detail": ""},
                 "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                 "tests": {"ran": should_run_tests, "passed": True, "detail": untested_flag or "passed"},
                 "scope": {"ran": True, "passed": True, "detail": ""},
