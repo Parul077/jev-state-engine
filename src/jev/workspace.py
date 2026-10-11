@@ -10,7 +10,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -66,6 +66,24 @@ class SuppressionCheckResult(BaseModel):
         return iter((self.passed, self.detail))
 
 
+class UnresolvedImportCheckResult(BaseModel):
+    passed: bool
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return self.passed
+
+    def __iter__(self):
+        return iter((self.passed, self.detail))
+
+
+@dataclass(frozen=True)
+class AddedDiffLine:
+    file: str
+    line_number: int
+    text: str
+
+
 class ScopeCheckResult(BaseModel):
     passed: bool
     out_of_scope: List[str] = Field(default_factory=list)
@@ -105,6 +123,10 @@ SUPPRESSION_DIRECTIVES: Dict[str, List[str]] = {
     ".jsx": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
     ".mjs": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
     ".cjs": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".mts": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".cts": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".vue": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
+    ".svelte": ["@ts-ignore", "@ts-nocheck", "@ts-expect-error"],
     ".py": ["# type: ignore", "# mypy: ignore-errors", "# pyright: ignore"],
     ".pyi": ["# type: ignore", "# mypy: ignore-errors", "# pyright: ignore"],
     ".go": [],
@@ -112,6 +134,36 @@ SUPPRESSION_DIRECTIVES: Dict[str, List[str]] = {
     ".java": [],
     ".kt": [],
     ".kts": [],
+}
+
+UNRESOLVED_IMPORT_RESOLVERS: Dict[str, Optional[str]] = {
+    ".ts": "js_ts",
+    ".tsx": "js_ts",
+    ".js": "js_ts",
+    ".jsx": "js_ts",
+    ".mjs": "js_ts",
+    ".cjs": "js_ts",
+    ".mts": "js_ts",
+    ".cts": "js_ts",
+    ".vue": "js_ts",
+    ".svelte": "js_ts",
+    ".py": None,
+    ".go": None,
+    ".rs": None,
+    ".java": None,
+    ".kt": None,
+}
+
+NODE_BUILTIN_MODULES = {
+    "assert", "async_hooks", "buffer", "child_process", "cluster",
+    "console", "constants", "crypto", "dgram", "diagnostics_channel",
+    "dns", "domain", "events", "fs", "fs/promises", "http", "http2",
+    "https", "inspector", "module", "net", "os", "path", "path/posix",
+    "path/win32", "perf_hooks", "process", "punycode", "querystring",
+    "readline", "repl", "stream", "stream/consumers", "stream/promises",
+    "stream/web", "string_decoder", "sys", "timers", "timers/promises",
+    "tls", "trace_events", "tty", "url", "util", "util/types", "v8",
+    "vm", "wasi", "worker_threads", "zlib", "test"
 }
 
 
@@ -388,6 +440,7 @@ ECOSYSTEM_COMPILE_HANDLERS = [
 
 class Workspace:
     SUPPRESSION_DIRECTIVES = SUPPRESSION_DIRECTIVES
+    UNRESOLVED_IMPORT_RESOLVERS = UNRESOLVED_IMPORT_RESOLVERS
 
     def __init__(
         self,
@@ -1353,6 +1406,54 @@ class Workspace:
                         touched.add(cls._clean_diff_path(p_b))
         return touched
 
+    @classmethod
+    def _iter_added_lines(cls, diff: str) -> Iterator[AddedDiffLine]:
+        """Walks added lines of diff yielding AddedDiffLine(file, line_number, text).
+
+        Decides line type based on first character after the first @@ hunk header of a file.
+        Resets state on 'diff --git '.
+        """
+        current_file: Optional[str] = None
+        in_hunk: bool = False
+        current_line_num: int = 0
+        hunk_header_re = re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
+
+        for raw_line in diff.splitlines():
+            if raw_line.startswith("diff --git "):
+                current_file = None
+                in_hunk = False
+                current_line_num = 0
+                continue
+
+            if not in_hunk:
+                if raw_line.startswith("+++ "):
+                    target = raw_line[4:].strip()
+                    if target.startswith("b/"):
+                        target = target[2:]
+                    if target == "/dev/null":
+                        current_file = None
+                    else:
+                        current_file = cls._clean_diff_path(target)
+                    continue
+
+            m = hunk_header_re.match(raw_line)
+            if m:
+                in_hunk = True
+                current_line_num = int(m.group(1))
+                continue
+
+            if in_hunk and current_file is not None:
+                first_char = raw_line[:1]
+                if first_char == "+":
+                    yield AddedDiffLine(file=current_file, line_number=current_line_num, text=raw_line[1:])
+                    current_line_num += 1
+                elif first_char == " ":
+                    current_line_num += 1
+                elif first_char == "-":
+                    pass
+                elif first_char == "\\":
+                    pass
+
     def check_suppression(self, diff: Optional[str] = None) -> SuppressionCheckResult:
         """Scans only the added lines of the staged diff for compiler or type-check suppression directives."""
         if diff is None:
@@ -1361,67 +1462,215 @@ class Workspace:
         if not diff or not diff.strip():
             return SuppressionCheckResult(passed=True, detail="")
 
-        current_file: Optional[str] = None
-        current_directives: List[str] = []
-        current_line_num: int = 0
-
-        hunk_header_re = re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@")
-
-        for raw_line in diff.splitlines():
-            if raw_line.startswith("diff --git "):
-                current_file = None
-                current_directives = []
-                current_line_num = 0
+        for item in self._iter_added_lines(diff):
+            ext = Path(item.file).suffix.lower()
+            directives = self.SUPPRESSION_DIRECTIVES.get(ext, [])
+            if not directives:
                 continue
 
-            if raw_line.startswith("+++ "):
-                target = raw_line[4:].strip()
-                if target.startswith("b/"):
-                    target = target[2:]
-                if target == "/dev/null":
-                    current_file = None
-                    current_directives = []
-                else:
-                    target = self._clean_diff_path(target)
-                    current_file = target
-                    ext = Path(target).suffix.lower()
-                    current_directives = self.SUPPRESSION_DIRECTIVES.get(ext, [])
-                continue
-
-            if current_file is None or not current_directives:
-                continue
-
-            m = hunk_header_re.match(raw_line)
-            if m:
-                current_line_num = int(m.group(1))
-                continue
-
-            if raw_line.startswith("+") and not raw_line.startswith("+++"):
-                added_content = raw_line[1:]
-                for directive in current_directives:
-                    matched = False
-                    if directive in added_content:
+            for directive in directives:
+                matched = False
+                if directive in item.text:
+                    matched = True
+                elif directive.startswith("#"):
+                    norm_dir = directive.replace(" ", "")
+                    norm_line = item.text.replace(" ", "")
+                    if norm_dir in norm_line:
                         matched = True
-                    elif directive.startswith("#"):
-                        norm_dir = directive.replace(" ", "")
-                        norm_line = added_content.replace(" ", "")
-                        if norm_dir in norm_line:
-                            matched = True
 
-                    if matched:
-                        detail = (
-                            f"Compiler/type-check suppression directive '{directive}' found in {current_file} "
-                            f"at line {current_line_num}: '{added_content.strip()}'. "
-                            f"Do not suppress compiler errors. Fix the cause, or escalate if it cannot be fixed."
-                        )
-                        return SuppressionCheckResult(passed=False, detail=detail)
-                current_line_num += 1
-            elif raw_line.startswith(" "):
-                current_line_num += 1
-            elif raw_line.startswith("-") and not raw_line.startswith("---"):
-                pass
+                if matched:
+                    detail = (
+                        f"Compiler/type-check suppression directive '{directive}' found in {item.file} "
+                        f"at line {item.line_number}: '{item.text.strip()}'. "
+                        f"Do not suppress compiler errors. Fix the cause, or escalate if it cannot be fixed."
+                    )
+                    return SuppressionCheckResult(passed=False, detail=detail)
 
         return SuppressionCheckResult(passed=True, detail="")
+
+    @staticmethod
+    def _reduce_to_package_name(specifier: str) -> str:
+        parts = specifier.split("/")
+        if specifier.startswith("@"):
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+            return specifier
+        return parts[0]
+
+    def _resolve_package(self, file_path: str, pkg_name: str) -> bool:
+        p = Path(file_path)
+        current_dir = p.parent
+
+        dirs_to_check = []
+        curr = current_dir
+        while True:
+            dirs_to_check.append(curr)
+            if curr == Path(".") or curr == Path("") or str(curr) in (".", ""):
+                break
+            parent = curr.parent
+            if parent == curr:
+                break
+            curr = parent
+
+        if Path(".") not in dirs_to_check:
+            dirs_to_check.append(Path("."))
+
+        for d in dirs_to_check:
+            for base in (self.worktree_dir, self.repo_dir):
+                candidate = base / d / "node_modules" / pkg_name
+                if candidate.exists() or candidate.is_dir() or candidate.is_file() or candidate.is_symlink():
+                    return True
+
+        return False
+
+    def _is_declared_in_package_json(self, file_path: str, pkg_name: str) -> bool:
+        p = Path(file_path)
+        current_dir = p.parent
+
+        dirs_to_check = []
+        curr = current_dir
+        while True:
+            dirs_to_check.append(curr)
+            if curr == Path(".") or curr == Path("") or str(curr) in (".", ""):
+                break
+            parent = curr.parent
+            if parent == curr:
+                break
+            curr = parent
+
+        if Path(".") not in dirs_to_check:
+            dirs_to_check.append(Path("."))
+
+        dep_keys = ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies")
+
+        for d in dirs_to_check:
+            for base in (self.worktree_dir, self.repo_dir):
+                pkg_json_path = base / d / "package.json"
+                if pkg_json_path.exists() and pkg_json_path.is_file():
+                    try:
+                        data = json.loads(pkg_json_path.read_text(encoding="utf-8"))
+                        if isinstance(data, dict):
+                            for k in dep_keys:
+                                deps = data.get(k)
+                                if isinstance(deps, dict) and pkg_name in deps:
+                                    return True
+                    except Exception:
+                        pass
+        return False
+
+    def _get_tsconfig_path_aliases(self, file_path: str) -> List[str]:
+        p = Path(file_path)
+        current_dir = p.parent
+
+        dirs_to_check = []
+        curr = current_dir
+        while True:
+            dirs_to_check.append(curr)
+            if curr == Path(".") or curr == Path("") or str(curr) in (".", ""):
+                break
+            parent = curr.parent
+            if parent == curr:
+                break
+            curr = parent
+
+        if Path(".") not in dirs_to_check:
+            dirs_to_check.append(Path("."))
+
+        aliases: List[str] = ["@/"]
+
+        for d in dirs_to_check:
+            for base in (self.worktree_dir, self.repo_dir):
+                for cfg_name in ("tsconfig.json", "jsconfig.json"):
+                    cfg_path = base / d / cfg_name
+                    if cfg_path.exists() and cfg_path.is_file():
+                        try:
+                            text = cfg_path.read_text(encoding="utf-8")
+                            text_no_comments = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+                            text_no_comments = re.sub(r"/\*.*?\*/", "", text_no_comments, flags=re.DOTALL)
+                            data = json.loads(text_no_comments)
+                            if isinstance(data, dict):
+                                paths = data.get("compilerOptions", {}).get("paths", {})
+                                if isinstance(paths, dict):
+                                    for alias_key in paths.keys():
+                                        if alias_key.endswith("*"):
+                                            aliases.append(alias_key[:-1])
+                                        else:
+                                            aliases.append(alias_key)
+                        except Exception:
+                            pass
+        return list(set(aliases))
+
+    def check_unresolved_imports(self, diff: Optional[str] = None) -> UnresolvedImportCheckResult:
+        """Scans added lines of JS/TS-family files for uninstalled package imports."""
+        if diff is None:
+            diff = self.get_staged_diff()
+
+        if not diff or not diff.strip():
+            return UnresolvedImportCheckResult(passed=True, detail="")
+
+        from_re = re.compile(r"""(?:\b(?:import|export)\b[\s\S]*?\bfrom|\}\s*from)\s+['"]([^'"]+)['"]""")
+        side_effect_re = re.compile(r"""\bimport\s+['"]([^'"]+)['"]""")
+        dynamic_re = re.compile(r"""\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)""")
+        require_re = re.compile(r"""\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)""")
+        declare_mod_re = re.compile(r"""\bdeclare\s+module\s+['"]([^'"]+)['"]""")
+
+        for item in self._iter_added_lines(diff):
+            ext = Path(item.file).suffix.lower()
+            resolver = self.UNRESOLVED_IMPORT_RESOLVERS.get(ext)
+            if resolver != "js_ts":
+                continue
+
+            raw_text = item.text
+            line_no_block = re.sub(r"/\*.*?\*/", "", raw_text)
+            idx = line_no_block.find("//")
+            code = line_no_block[:idx] if idx != -1 else line_no_block
+            code = code.strip()
+            if not code or code.startswith("*"):
+                continue
+
+            specifiers: List[str] = []
+            for m in from_re.finditer(code):
+                specifiers.append(m.group(1))
+            for m in side_effect_re.finditer(code):
+                specifiers.append(m.group(1))
+            for m in dynamic_re.finditer(code):
+                specifiers.append(m.group(1))
+            for m in require_re.finditer(code):
+                specifiers.append(m.group(1))
+            for m in declare_mod_re.finditer(code):
+                specifiers.append(m.group(1))
+
+            if not specifiers:
+                continue
+
+            path_aliases = self._get_tsconfig_path_aliases(item.file)
+
+            for spec in specifiers:
+                if spec.startswith("./") or spec.startswith("../") or spec in (".", ".."):
+                    continue
+                if spec.startswith("/") or re.match(r"^[a-zA-Z]:", spec):
+                    continue
+                if spec.startswith("node:") or spec in NODE_BUILTIN_MODULES:
+                    continue
+                if "*" in spec:
+                    continue
+                if any(spec == alias or (alias.endswith("/") and spec.startswith(alias)) or (not alias.endswith("/") and spec.startswith(alias + "/")) for alias in path_aliases):
+                    continue
+
+                pkg_name = self._reduce_to_package_name(spec)
+                if pkg_name in NODE_BUILTIN_MODULES:
+                    continue
+
+                if not self._resolve_package(item.file, pkg_name):
+                    declared_str = "yes" if self._is_declared_in_package_json(item.file, pkg_name) else "no"
+                    detail = (
+                        f"Package '{pkg_name}' is imported in {item.file} at line {item.line_number} but is not installed "
+                        f"(declared in package.json: {declared_str}). Do not import packages that are not installed. "
+                        f"Use only installed packages, or escalate if the ticket requires a package that does not exist."
+                    )
+                    return UnresolvedImportCheckResult(passed=False, detail=detail)
+
+        return UnresolvedImportCheckResult(passed=True, detail="")
 
     def check_scope(
         self,
@@ -2124,6 +2373,7 @@ class Workspace:
                 checks={
                     "build": {"ran": True, "passed": False, "detail": build_res.detail},
                     "suppression": {"ran": False, "passed": None},
+                    "unresolved_import": {"ran": False, "passed": None},
                     "compile": {"ran": False, "passed": None},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
@@ -2144,6 +2394,7 @@ class Workspace:
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "suppression": {"ran": True, "passed": False, "detail": suppression_res.detail},
+                    "unresolved_import": {"ran": False, "passed": None},
                     "compile": {"ran": False, "passed": None},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
@@ -2152,7 +2403,27 @@ class Workspace:
                 test_runner_outcome=None,
             )
 
-        # 3. check_compile
+        # 3. check_unresolved_imports
+        unresolved_res = self.check_unresolved_imports(diff=diff)
+        if not unresolved_res.passed:
+            return MechanicalCheckResult(
+                passed=False,
+                failed_check="unresolved_import",
+                detail=unresolved_res.detail,
+                checks_run=["build", "suppression", "unresolved_import"],
+                checks={
+                    "build": {"ran": True, "passed": True, "detail": ""},
+                    "suppression": {"ran": True, "passed": True, "detail": ""},
+                    "unresolved_import": {"ran": True, "passed": False, "detail": unresolved_res.detail},
+                    "compile": {"ran": False, "passed": None},
+                    "tests": {"ran": False, "passed": None},
+                    "scope": {"ran": False, "passed": None},
+                },
+                compile_outcome=None,
+                test_runner_outcome=None,
+            )
+
+        # 4. check_compile
         compile_res = self.check_compile(diff=diff, scope=subgoal.scope, base_commit=base_commit)
         compile_outcome = compile_res.get("outcome")
 
@@ -2161,10 +2432,11 @@ class Workspace:
                 passed=False,
                 failed_check="compile",
                 detail=compile_res.get("detail", "Compile check failed."),
-                checks_run=["build", "suppression", "compile"],
+                checks_run=["build", "suppression", "unresolved_import", "compile"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "suppression": {"ran": True, "passed": True, "detail": ""},
+                    "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
@@ -2177,10 +2449,11 @@ class Workspace:
                 passed=False,
                 failed_check="no_compile_command",
                 detail=compile_res.get("detail", "No compile command found."),
-                checks_run=["build", "suppression", "compile"],
+                checks_run=["build", "suppression", "unresolved_import", "compile"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "suppression": {"ran": True, "passed": True, "detail": ""},
+                    "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
@@ -2193,10 +2466,11 @@ class Workspace:
                 passed=False,
                 failed_check="env_not_ready",
                 detail=compile_res.get("detail", "Environment not ready."),
-                checks_run=["build", "suppression", "compile"],
+                checks_run=["build", "suppression", "unresolved_import", "compile"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "suppression": {"ran": True, "passed": True, "detail": ""},
+                    "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": False, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": False, "passed": None},
                     "scope": {"ran": False, "passed": None},
@@ -2205,7 +2479,7 @@ class Workspace:
                 test_runner_outcome=None,
             )
 
-        # 4. run_tests
+        # 5. run_tests
         should_run_tests = False
         if test_policy == "always":
             should_run_tests = True
@@ -2238,10 +2512,11 @@ class Workspace:
                 passed=False,
                 failed_check="env_not_ready",
                 detail=f"Environment not ready: {err_detail}",
-                checks_run=["build", "suppression", "compile", "tests"],
+                checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "suppression": {"ran": True, "passed": True, "detail": ""},
+                    "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": True, "passed": False, "detail": f"Environment not ready: {err_detail}"},
                     "scope": {"ran": False, "passed": None},
@@ -2254,10 +2529,11 @@ class Workspace:
                 passed=False,
                 failed_check="tests",
                 detail="Unit tests failed.",
-                checks_run=["build", "suppression", "compile", "tests"],
+                checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "suppression": {"ran": True, "passed": True, "detail": ""},
+                    "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": True, "passed": False, "detail": "Unit tests failed."},
                     "scope": {"ran": False, "passed": None},
@@ -2273,10 +2549,11 @@ class Workspace:
                         passed=False,
                         failed_check="no_tests_collected",
                         detail=detail_msg,
-                        checks_run=["build", "suppression", "compile", "tests"],
+                        checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
                         checks={
                             "build": {"ran": True, "passed": True, "detail": ""},
                             "suppression": {"ran": True, "passed": True, "detail": ""},
+                            "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                             "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                             "tests": {"ran": True, "passed": False, "detail": detail_msg},
                             "scope": {"ran": False, "passed": None},
@@ -2287,17 +2564,18 @@ class Workspace:
         elif test_outcome == TestOutcome.NO_TEST_FRAMEWORK:
             pass
 
-        # 5. check_scope
+        # 6. check_scope
         scope_res = self.check_scope(diff, subgoal.scope)
         if not scope_res.passed:
             return MechanicalCheckResult(
                 passed=False,
                 failed_check="scope",
                 detail=scope_res.detail,
-                checks_run=["build", "suppression", "compile", "tests", "scope"] if should_run_tests else ["build", "suppression", "compile", "scope"],
+                checks_run=["build", "suppression", "unresolved_import", "compile", "tests", "scope"] if should_run_tests else ["build", "suppression", "unresolved_import", "compile", "scope"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "suppression": {"ran": True, "passed": True, "detail": ""},
+                    "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                     "tests": {"ran": should_run_tests, "passed": True, "detail": "" if should_run_tests else f"Skipped per test policy: {test_policy}"},
                     "scope": {"ran": True, "passed": False, "detail": scope_res.detail},
@@ -2327,10 +2605,11 @@ class Workspace:
             passed=True,
             failed_check=None,
             detail=untested_flag,
-            checks_run=["build", "suppression", "compile", "tests", "scope"] if should_run_tests else ["build", "suppression", "compile", "scope"],
+            checks_run=["build", "suppression", "unresolved_import", "compile", "tests", "scope"] if should_run_tests else ["build", "suppression", "unresolved_import", "compile", "scope"],
             checks={
                 "build": {"ran": True, "passed": True, "detail": ""},
                 "suppression": {"ran": True, "passed": True, "detail": ""},
+                "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                 "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
                 "tests": {"ran": should_run_tests, "passed": True, "detail": untested_flag or "passed"},
                 "scope": {"ran": True, "passed": True, "detail": ""},

@@ -36,7 +36,7 @@ class Subgoal(BaseModel):
 
 class MechanicalCheckResult(BaseModel):
     passed: bool
-    failed_check: Optional[str] = None  # "build" | "suppression" | "compile" | "no_compile_command" | "env_not_ready" | "tests" | "no_tests_collected" | "scope"
+    failed_check: Optional[str] = None  # "build" | "suppression" | "unresolved_import" | "compile" | "no_compile_command" | "env_not_ready" | "tests" | "no_tests_collected" | "scope"
     detail: str = ""
     checks_run: List[str] = Field(default_factory=list)
     checks: Dict[str, Any] = Field(default_factory=dict)
