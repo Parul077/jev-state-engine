@@ -20,6 +20,9 @@ def repo_workspace(tmp_path):
     subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
 
+    # Base node_modules in repo root
+    (repo / "node_modules").mkdir(exist_ok=True)
+
     return Workspace(repo_dir=repo)
 
 
@@ -408,6 +411,7 @@ def test_unresolved_import_feedback_message_format(repo_workspace):
     subprocess.run(["git", "reset", "HEAD", "--", "."], cwd=ws.repo_dir, check=True, capture_output=True)
     subprocess.run(["git", "checkout", "--", "."], cwd=ws.repo_dir, check=True, capture_output=True)
     subprocess.run(["git", "clean", "-fd"], cwd=ws.repo_dir, check=True, capture_output=True)
+    (ws.repo_dir / "node_modules").mkdir(exist_ok=True)
 
     # Subcase 2: declared in package.json: no
     subgoal2 = Subgoal(description="Import undeclared", scope=["src/comp2.ts"], expects_tests=False)
@@ -425,3 +429,122 @@ def test_unresolved_import_feedback_message_format(repo_workspace):
         "Use only installed packages, or escalate if the ticket requires a package that does not exist."
     )
     assert expected_msg2 in res2.detail
+
+
+# =========================================================================
+# Case 13: Non-npm grammar specifiers pass
+# =========================================================================
+
+@pytest.mark.parametrize("specifier", [
+    "#internal/x",
+    "bun:test",
+    "virtual:pwa-register",
+    "~/lib/x",
+    "$lib/x",
+])
+def test_non_npm_grammar_specifiers_pass(repo_workspace, specifier):
+    """Specifiers that don't match npm package name grammar (#internal, bun:, virtual:, ~, $) must be skipped."""
+    ws = repo_workspace
+    subgoal = Subgoal(description="Add file", scope=["src/index.ts"], expects_tests=False)
+
+    f = ws.repo_dir / "src" / "index.ts"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(f"import foo from '{specifier}';\n", encoding="utf-8")
+    subprocess.run(["git", "add", "src/index.ts"], cwd=ws.repo_dir, check=True, capture_output=True)
+
+    res = ws.run_mechanical_checks(subgoal)
+    assert res.failed_check != "unresolved_import"
+
+
+# =========================================================================
+# Case 14: Alias defined in parent config reached through extends passes
+# =========================================================================
+
+def test_extends_parent_tsconfig_alias_passes(repo_workspace):
+    """Path alias defined in a parent config reached through extends must pass."""
+    ws = repo_workspace
+    subgoal = Subgoal(description="Add file", scope=["src/index.ts"], expects_tests=False)
+
+    # Parent config
+    base_config = ws.repo_dir / "tsconfig.base.json"
+    base_config.write_text(json.dumps({
+        "compilerOptions": {
+            "paths": {
+                "@parent-alias/*": ["src/parent/*"]
+            }
+        }
+    }), encoding="utf-8")
+
+    # Child config extending parent
+    child_config = ws.repo_dir / "tsconfig.json"
+    child_config.write_text(json.dumps({
+        "extends": "./tsconfig.base"
+    }), encoding="utf-8")
+
+    f = ws.repo_dir / "src" / "index.ts"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("import something from '@parent-alias/utils';\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=ws.repo_dir, check=True, capture_output=True)
+
+    res = ws.run_mechanical_checks(subgoal)
+    assert res.failed_check != "unresolved_import"
+
+
+# =========================================================================
+# Case 15: baseUrl-relative import passes
+# =========================================================================
+
+def test_base_url_relative_import_passes(repo_workspace):
+    """If baseUrl is set, a specifier whose first segment exists as a file or directory under baseUrl must pass."""
+    ws = repo_workspace
+    subgoal = Subgoal(description="Add file", scope=["src/index.ts"], expects_tests=False)
+
+    tsconfig = ws.repo_dir / "tsconfig.json"
+    tsconfig.write_text(json.dumps({
+        "compilerOptions": {
+            "baseUrl": "./src"
+        }
+    }), encoding="utf-8")
+
+    # Create a directory and file under src/
+    helpers_dir = ws.repo_dir / "src" / "helpers"
+    helpers_dir.mkdir(parents=True, exist_ok=True)
+    (helpers_dir / "math.ts").write_text("export const add = 1;\n", encoding="utf-8")
+
+    f = ws.repo_dir / "src" / "index.ts"
+    f.write_text("import { add } from 'helpers/math';\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=ws.repo_dir, check=True, capture_output=True)
+
+    res = ws.run_mechanical_checks(subgoal)
+    assert res.failed_check != "unresolved_import"
+
+
+# =========================================================================
+# Case 16: No node_modules anywhere -> import 'react' passes this check
+# =========================================================================
+
+def test_no_node_modules_anywhere_passes_unresolved_import(tmp_path):
+    """If no node_modules exists anywhere in the resolution chain, check_unresolved_imports returns passed."""
+    repo = tmp_path / "repo_no_nm"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=repo, check=True, capture_output=True)
+
+    (repo / "init.txt").write_text("initial", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    ws = Workspace(repo_dir=repo)
+    assert not (repo / "node_modules").exists()
+
+    subgoal = Subgoal(description="Add react import", scope=["src/App.tsx"], expects_tests=False)
+    f = ws.repo_dir / "src" / "App.tsx"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("import React from 'react';\n", encoding="utf-8")
+    subprocess.run(["git", "add", "src/App.tsx"], cwd=ws.repo_dir, check=True, capture_output=True)
+
+    res = ws.run_mechanical_checks(subgoal)
+    assert res.failed_check != "unresolved_import"
+    assert res.checks["unresolved_import"]["passed"] is True
+

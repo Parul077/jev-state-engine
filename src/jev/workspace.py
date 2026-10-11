@@ -166,6 +166,8 @@ NODE_BUILTIN_MODULES = {
     "vm", "wasi", "worker_threads", "zlib", "test"
 }
 
+NPM_PACKAGE_PATTERN = re.compile(r"^(?:@[a-z0-9][a-z0-9_.-]*/)?[a-z0-9][a-z0-9_.-]*$")
+
 
 class BaseCompileHandler:
     name: str = ""
@@ -1558,7 +1560,11 @@ class Workspace:
                         pass
         return False
 
-    def _get_tsconfig_path_aliases(self, file_path: str) -> List[str]:
+    @classmethod
+    def _is_npm_package_name(cls, pkg_name: str) -> bool:
+        return bool(NPM_PACKAGE_PATTERN.match(pkg_name))
+
+    def _has_node_modules_in_chain(self, file_path: str) -> bool:
         p = Path(file_path)
         current_dir = p.parent
 
@@ -1576,29 +1582,153 @@ class Workspace:
         if Path(".") not in dirs_to_check:
             dirs_to_check.append(Path("."))
 
-        aliases: List[str] = ["@/"]
+        for d in dirs_to_check:
+            for base in (self.worktree_dir, self.repo_dir):
+                nm = base / d / "node_modules"
+                if nm.exists() or nm.is_dir() or nm.is_symlink():
+                    return True
+        return False
+
+    def _get_tsconfig_info(self, file_path: str) -> tuple[List[str], List[Path]]:
+        p = Path(file_path)
+        current_dir = p.parent
+
+        dirs_to_check = []
+        curr = current_dir
+        while True:
+            dirs_to_check.append(curr)
+            if curr == Path(".") or curr == Path("") or str(curr) in (".", ""):
+                break
+            parent = curr.parent
+            if parent == curr:
+                break
+            curr = parent
+
+        if Path(".") not in dirs_to_check:
+            dirs_to_check.append(Path("."))
+
+        aliases: set[str] = {"@/"}
+        base_urls: list[Path] = []
+        visited: set[str] = set()
+
+        def _load_and_follow(cfg_path: Path, depth: int) -> None:
+            if depth > 5:
+                return
+            resolved_key = str(cfg_path.resolve())
+            if resolved_key in visited:
+                return
+            visited.add(resolved_key)
+
+            try:
+                text = cfg_path.read_text(encoding="utf-8")
+            except Exception:
+                return
+
+            text_no_comments = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
+            text_no_comments = re.sub(r"/\*.*?\*/", "", text_no_comments, flags=re.DOTALL)
+            try:
+                data = json.loads(text_no_comments)
+            except Exception:
+                return
+
+            if not isinstance(data, dict):
+                return
+
+            compiler_opts = data.get("compilerOptions")
+            if isinstance(compiler_opts, dict):
+                paths = compiler_opts.get("paths")
+                if isinstance(paths, dict):
+                    for alias_key in paths.keys():
+                        if alias_key.endswith("*"):
+                            aliases.add(alias_key[:-1])
+                        else:
+                            aliases.add(alias_key)
+
+                base_url_val = compiler_opts.get("baseUrl")
+                if base_url_val and isinstance(base_url_val, str):
+                    cfg_dir = cfg_path.parent
+                    rel_to_root = None
+                    for root in (self.worktree_dir, self.repo_dir):
+                        try:
+                            rel_to_root = cfg_dir.relative_to(root)
+                            break
+                        except ValueError:
+                            pass
+                    if rel_to_root is not None:
+                        base_urls.append(rel_to_root / base_url_val)
+                    else:
+                        base_urls.append(cfg_dir / base_url_val)
+
+            extends_val = data.get("extends")
+            if extends_val:
+                if isinstance(extends_val, str):
+                    extends_list = [extends_val]
+                elif isinstance(extends_val, list):
+                    extends_list = extends_val
+                else:
+                    extends_list = []
+
+                cfg_dir = cfg_path.parent
+                rel_cfg_dir = None
+                for root in (self.worktree_dir, self.repo_dir):
+                    try:
+                        rel_cfg_dir = cfg_dir.relative_to(root)
+                        break
+                    except ValueError:
+                        pass
+
+                for ext_target in extends_list:
+                    if not isinstance(ext_target, str) or ext_target.startswith("@"):
+                        continue
+
+                    target_p = Path(ext_target)
+                    candidate_rels = []
+                    if rel_cfg_dir is not None:
+                        candidate_rels.append(rel_cfg_dir / target_p)
+                        if not ext_target.endswith(".json"):
+                            candidate_rels.append(rel_cfg_dir / Path(f"{ext_target}.json"))
+                    else:
+                        candidate_rels.append(cfg_dir / target_p)
+                        if not ext_target.endswith(".json"):
+                            candidate_rels.append(cfg_dir / Path(f"{ext_target}.json"))
+
+                    found = False
+                    for cand in candidate_rels:
+                        for root in (self.worktree_dir, self.repo_dir):
+                            full_path = cand if cand.is_absolute() else root / cand
+                            if full_path.exists() and full_path.is_file():
+                                _load_and_follow(full_path, depth + 1)
+                                found = True
+                                break
+                        if found:
+                            break
 
         for d in dirs_to_check:
             for base in (self.worktree_dir, self.repo_dir):
                 for cfg_name in ("tsconfig.json", "jsconfig.json"):
                     cfg_path = base / d / cfg_name
                     if cfg_path.exists() and cfg_path.is_file():
-                        try:
-                            text = cfg_path.read_text(encoding="utf-8")
-                            text_no_comments = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
-                            text_no_comments = re.sub(r"/\*.*?\*/", "", text_no_comments, flags=re.DOTALL)
-                            data = json.loads(text_no_comments)
-                            if isinstance(data, dict):
-                                paths = data.get("compilerOptions", {}).get("paths", {})
-                                if isinstance(paths, dict):
-                                    for alias_key in paths.keys():
-                                        if alias_key.endswith("*"):
-                                            aliases.append(alias_key[:-1])
-                                        else:
-                                            aliases.append(alias_key)
-                        except Exception:
-                            pass
-        return list(set(aliases))
+                        _load_and_follow(cfg_path, 0)
+
+        return list(aliases), base_urls
+
+    def _get_tsconfig_path_aliases(self, file_path: str) -> List[str]:
+        aliases, _ = self._get_tsconfig_info(file_path)
+        return aliases
+
+    def _matches_base_url(self, first_segment: str, base_urls: List[Path]) -> bool:
+        if not base_urls:
+            return False
+        for bu in base_urls:
+            for root in (self.worktree_dir, self.repo_dir):
+                bu_path = bu if bu.is_absolute() else root / bu
+                target = bu_path / first_segment
+                if target.exists():
+                    return True
+                for ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".json"):
+                    if (bu_path / f"{first_segment}{ext}").is_file():
+                        return True
+        return False
 
     def check_unresolved_imports(self, diff: Optional[str] = None) -> UnresolvedImportCheckResult:
         """Scans added lines of JS/TS-family files for uninstalled package imports."""
@@ -1618,6 +1748,11 @@ class Workspace:
             ext = Path(item.file).suffix.lower()
             resolver = self.UNRESOLVED_IMPORT_RESOLVERS.get(ext)
             if resolver != "js_ts":
+                continue
+
+            # If no node_modules directory exists anywhere in the resolution chain,
+            # check_unresolved_imports returns passed for this file.
+            if not self._has_node_modules_in_chain(item.file):
                 continue
 
             raw_text = item.text
@@ -1643,7 +1778,7 @@ class Workspace:
             if not specifiers:
                 continue
 
-            path_aliases = self._get_tsconfig_path_aliases(item.file)
+            path_aliases, base_urls = self._get_tsconfig_info(item.file)
 
             for spec in specifiers:
                 if spec.startswith("./") or spec.startswith("../") or spec in (".", ".."):
@@ -1657,8 +1792,15 @@ class Workspace:
                 if any(spec == alias or (alias.endswith("/") and spec.startswith(alias)) or (not alias.endswith("/") and spec.startswith(alias + "/")) for alias in path_aliases):
                     continue
 
+                first_segment = spec.split("/")[0]
+                if self._matches_base_url(first_segment, base_urls):
+                    continue
+
                 pkg_name = self._reduce_to_package_name(spec)
                 if pkg_name in NODE_BUILTIN_MODULES:
+                    continue
+
+                if not self._is_npm_package_name(pkg_name):
                     continue
 
                 if not self._resolve_package(item.file, pkg_name):
