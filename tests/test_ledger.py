@@ -349,9 +349,11 @@ def test_faulty_ledger_logs_warning_and_run_succeeds(tmp_path, capsys):
 
     # Run must succeed without raising exception
     assert res is not None
-    # Captured warning message
+    # Captured warning message must be printed to stderr only (not stdout), exactly once
     captured = capsys.readouterr()
-    assert "ledger disabled for this run:" in captured.err or "ledger disabled for this run:" in captured.out
+    assert "ledger disabled for this run:" in captured.err
+    assert "ledger disabled for this run:" not in captured.out
+    assert captured.err.count("ledger disabled for this run:") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +380,7 @@ def test_repo_key_matches_for_two_clones(tmp_path):
 def test_cli_no_ledger_flag_works(tmp_path, monkeypatch):
     from main import build_parser, main
     from jev.ledger import NullRecorder
+    from unittest.mock import patch, MagicMock
 
     parser = build_parser()
     args = parser.parse_args(["some ticket", "--no-ledger"])
@@ -387,15 +390,52 @@ def test_cli_no_ledger_flag_works(tmp_path, monkeypatch):
     repo = _init_git_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
 
-    # Mock JevEngine execute to avoid full run
-    mock_engine = MagicMock()
-    mock_engine.return_value.execute.return_value = {"status": "completed"}
-    with monkeypatch.context() as m:
-        m.setattr("main.JevEngine", mock_engine)
+    # Ensure no API keys in environment
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_API_URL", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    mock_eng = MagicMock()
+    mock_eng.execute.return_value = {"status": "completed"}
+    with patch("main.Gatekeeper") as mock_gk_cls, patch("main.JevEngine") as mock_eng_cls:
+        mock_eng_cls.return_value = mock_eng
         exit_code = main(["some ticket", "--no-ledger", "--repo-dir", str(repo)])
         assert exit_code == 0
-        call_kwargs = mock_engine.call_args[1]
+        call_kwargs = mock_eng_cls.call_args[1]
         assert isinstance(call_kwargs.get("recorder"), NullRecorder)
+
+
+# ---------------------------------------------------------------------------
+# Test Case 7b: SqliteLedger construction failure falls back to NullRecorder
+# ---------------------------------------------------------------------------
+def test_cli_sqlite_ledger_construction_failure_falls_back_to_null_recorder(tmp_path, monkeypatch, capsys):
+    from main import main
+    from jev.ledger import NullRecorder
+    from unittest.mock import patch, MagicMock
+
+    repo = _init_git_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+
+    # Point JEV_HOME to a regular file instead of a directory
+    dummy_file = tmp_path / "jev_home_file"
+    dummy_file.write_text("not a directory")
+    monkeypatch.setenv("JEV_HOME", str(dummy_file))
+
+    monkeypatch.delenv("JEV_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_API_URL", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+    mock_eng = MagicMock()
+    mock_eng.execute.return_value = {"status": "completed"}
+    with patch("main.Gatekeeper") as mock_gk_cls, patch("main.JevEngine") as mock_eng_cls:
+        mock_eng_cls.return_value = mock_eng
+        exit_code = main(["some ticket", "--repo-dir", str(repo)])
+        assert exit_code == 0
+        call_kwargs = mock_eng_cls.call_args[1]
+        assert isinstance(call_kwargs.get("recorder"), NullRecorder)
+
+    captured = capsys.readouterr()
+    assert "ledger disabled:" in captured.err
 
 
 # ---------------------------------------------------------------------------

@@ -54,7 +54,6 @@ class SafeRecorder(NullRecorder):
             self.disabled = True
             msg = f"ledger disabled for this run: {exc}"
             print(f"WARNING: {msg}", file=sys.stderr, flush=True)
-            print(f"WARNING: {msg}", flush=True)
             return None
 
     def record_run_start(self, *args: Any, **kwargs: Any) -> None:

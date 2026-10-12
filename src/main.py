@@ -82,7 +82,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.no_ledger:
         recorder = NullRecorder()
     else:
-        recorder = SqliteLedger(repo_dir=repo_dir)
+        try:
+            recorder = SqliteLedger(repo_dir=repo_dir)
+        except Exception as e:
+            print(f"ledger disabled: {e}", file=sys.stderr, flush=True)
+            recorder = NullRecorder()
 
     # Wire Gemini LLM (gemini-3.5-flash-lite) via langchain-google-genai
     google_api_key = os.environ.get("GOOGLE_API_KEY")
