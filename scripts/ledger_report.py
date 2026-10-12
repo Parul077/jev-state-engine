@@ -7,6 +7,11 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+# Ensure repo's src directory is on sys.path
+_src_dir = str(Path(__file__).resolve().parent.parent / "src")
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
 from jev.ledger import compute_repo_key, get_jev_home
 
 

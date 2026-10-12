@@ -169,7 +169,7 @@ The engine isolates every code modification inside dedicated Git worktrees:
 The engine uses a dedicated SQLite checkpointer (`SqliteSaver`) built on LangGraph's `BaseCheckpointSaver`:
 * **WAL Mode Concurrency:** Configured with `PRAGMA journal_mode = WAL` and thread-safe reentrant locks (`threading.RLock`).
 * **Database Schema:** Persists serialized state dictionaries, metadata, and task-channel writes across two tables (`checkpoints` and `checkpoint_writes`).
-* **Session Resumption:** Runs are keyed by `--thread-id`. If an execution halts, crashes, or is paused for HITL review, providing the same `--thread-id` restores the complete FSM state, plan queue, strike history, and trajectory.
+* **Thread Isolation & Re-runs:** Runs are keyed by `--thread-id` (defaulting to an auto-generated unique ID). If an existing `--thread-id` is provided, the engine restarts execution from scratch (no resume) and deletes any prior integration branch for clean isolation.
 
 ---
 
@@ -230,8 +230,9 @@ python -m src.main "<TICKET_DESCRIPTION>" [OPTIONS]
 | `ticket` | String | *(Required)* | Task description or ticket specifications for the engine to execute. |
 | `--repo-dir` | Path | `.` (Current Dir) | Absolute or relative path to the target repository. |
 | `--db-path` | Path | `checkpoints.db` | Path to the SQLite checkpoint database. |
-| `--thread-id` | String | `main-thread` | Unique thread identifier for state persistence and run resumption. |
+| `--thread-id` | String | `run-<timestamp>-<hex>` | Unique thread identifier for state persistence. Defaults to an auto-generated timestamped ID (e.g., `run-20261012T120000Z-a1b2`). Rerunning an existing thread ID restarts from scratch (no resume) and deletes its prior integration branch. |
 | `--test-policy` | String | `auto` | Test execution policy (`auto`, `verify-only`, `never`, `always`). Controls whether test suites run on every subgoal, only during final verification, or are bypassed entirely. |
+| `--no-ledger` | Flag | `False` | Disable recording run events, subgoals, attempts, and diffs to the SQLite run ledger. |
 
 ### Examples
 
@@ -259,9 +260,10 @@ python -m src.main "Refactor user authentication pipeline" \
     --test-policy verify-only
 ```
 
-#### 4. Resume an interrupted or escalated thread
+#### 4. Thread identification & re-run behavior
+By default, `--thread-id` generates a unique run identifier (`run-<timestamp>-<hex>`). Specifying an existing `--thread-id` restarts execution from scratch (no resume) and deletes any prior integration branch:
+
 ```bash
-# Resumes execution from the exact state saved under 'ticket-101'
 python -m src.main "Add docstrings to all exported functions in auth.ts" \
     --repo-dir ../my-target-project \
     --db-path checkpoints.db \
@@ -272,6 +274,33 @@ python -m src.main "Add docstrings to all exported functions in auth.ts" \
 * **Exit Code `0`:** Ticket completed, verified, and merged cleanly.
 * **Exit Code `1`:** Execution halted or escalated.
   * Inspect `escalation.log` in the current working directory to review failure diagnostics, triggering tier, and execution trajectory.
+
+---
+
+## Run Ledger & Reporting
+
+The engine automatically records execution lineage, subgoals, gate attempt snapshots, Jev probability scores, and unified diffs into a persistent run ledger.
+
+* **Storage Path:** `$JEV_HOME/repos/<repo_key>/ledger.db`
+  * `JEV_HOME`: Base directory for engine persistence. Defaults to `~/.jev` (e.g. `C:\Users\<user>\.jev` on Windows). Can be configured via the `JEV_HOME` environment variable.
+  * `<repo_key>`: A 16-hex character SHA-256 digest computed across root commit hashes, ensuring stable identity across worktrees and clones.
+* **Disabling the Ledger:** Pass `--no-ledger` to run without SQLite ledger recording.
+
+### Ledger Viewer (`scripts/ledger_report.py`)
+
+A read-only viewer displays plain-text summaries of runs, subgoals (with parent/commit SHAs), gate attempts, mechanical check results, and semantic probabilities.
+
+**PowerShell Example:**
+```powershell
+# View report for the latest run in the target repository
+python scripts/ledger_report.py --repo-dir .
+
+# View a specific run by ID
+python scripts/ledger_report.py --repo-dir . --run-id run-20261012T120000Z-a1b2
+
+# View by repo key directly
+python scripts/ledger_report.py --repo-key e374640a3fd334bc
+```
 
 #### Sample `escalation.log`
 ```json

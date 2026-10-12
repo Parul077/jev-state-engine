@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -648,6 +649,97 @@ def test_node_verify_requires_integration_branch_missing_escalates():
     assert res["gate_status"] == "verification_failed"
     assert "integration_branch is required" in res["last_feedback"]
     gk.escalate_deadlock.assert_called_once()
+
+
+# 21. Test restart warning prints once, to stderr only
+def test_restart_thread_warning_printed_once_to_stderr(tmp_path, capsys):
+    ws = FakeWorkspace()
+    gk = FakeGatekeeper()
+    db_file = tmp_path / "restart_warn.db"
+
+    engine = JevEngine(workspace=ws, gatekeeper=gk, db_path=str(db_file))
+    # First execution creates checkpoints under thread
+    engine.execute(ticket="Task 1", thread_id="reused-thread")
+    capsys.readouterr()  # discard first run output
+
+    # Second execution with same thread_id must print warning once, to stderr only
+    engine.execute(ticket="Task 2", thread_id="reused-thread")
+    captured = capsys.readouterr()
+
+    warning_text = "Restarting thread from scratch and deleting prior integration branch (no resume)."
+    assert warning_text in captured.err
+    assert warning_text not in captured.out
+    assert captured.err.count(warning_text) == 1
+
+
+# 22. Test checkpoint Subgoal deserialization without warning and in strict msgpack mode
+def test_checkpoint_subgoal_deserialization_no_warning_and_strict_msgpack(tmp_path, caplog, monkeypatch):
+    import logging
+    from jev.models import Subgoal
+    from jev.engine import SqliteSaver
+    import langgraph.checkpoint.serde._msgpack as _msgpack
+
+    db_file = tmp_path / "serde_test.db"
+    saver = SqliteSaver.from_conn_string(str(db_file))
+
+    sg = Subgoal(id="sg-1", description="Test deserialization", scope=["foo.py"])
+    config = {"configurable": {"thread_id": "thread-serde", "checkpoint_ns": ""}}
+    checkpoint_data = {
+        "v": 1,
+        "id": "cp-serde-1",
+        "ts": "2026-09-22T00:00:00Z",
+        "channel_values": {
+            "current_subgoal": sg,
+            "plan_queue": [sg],
+        },
+        "channel_versions": {},
+        "versions_seen": {},
+    }
+
+    saver.put(config, checkpoint_data, {"source": "test"}, {})
+
+    # 1. Permissive loading: ensure no "Deserializing unregistered type" warning is logged
+    with caplog.at_level(logging.WARNING, logger="langgraph.checkpoint.serde.jsonplus"):
+        caplog.clear()
+        tup = saver.get_tuple(config)
+        assert tup is not None
+        loaded_sg = tup.checkpoint["channel_values"]["current_subgoal"]
+        assert isinstance(loaded_sg, Subgoal)
+        assert loaded_sg.id == "sg-1"
+        assert "Deserializing unregistered type" not in caplog.text
+
+    # 2. Strict loading with LANGGRAPH_STRICT_MSGPACK=true
+    monkeypatch.setenv("LANGGRAPH_STRICT_MSGPACK", "true")
+    monkeypatch.setattr(_msgpack, "STRICT_MSGPACK_ENABLED", True)
+    saver_strict = SqliteSaver.from_conn_string(str(db_file))
+    tup_strict = saver_strict.get_tuple(config)
+    assert tup_strict is not None
+    loaded_strict_sg = tup_strict.checkpoint["channel_values"]["current_subgoal"]
+    assert isinstance(loaded_strict_sg, Subgoal)
+    assert loaded_strict_sg.id == "sg-1"
+
+    # 3. Subprocess verification with LANGGRAPH_STRICT_MSGPACK=true
+    import subprocess
+    env = os.environ.copy()
+    env["LANGGRAPH_STRICT_MSGPACK"] = "true"
+    sub_cmd = (
+        f"import sys; sys.path.insert(0, 'src'); "
+        f"from jev.engine import SqliteSaver; from jev.models import Subgoal; "
+        f"saver = SqliteSaver.from_conn_string(r'{db_file}'); "
+        f"tup = saver.get_tuple({config}); "
+        f"assert isinstance(tup.checkpoint['channel_values']['current_subgoal'], Subgoal); "
+        f"print('STRICT_OK')"
+    )
+    repo_root = Path(__file__).resolve().parent.parent
+    sub_res = subprocess.run(
+        [sys.executable, "-c", sub_cmd],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert sub_res.returncode == 0
+    assert "STRICT_OK" in sub_res.stdout
 
 
 

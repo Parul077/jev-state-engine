@@ -24,12 +24,32 @@ from langgraph.checkpoint.base import (
     CheckpointMetadata,
     CheckpointTuple,
 )
+from langgraph.checkpoint.serde.base import SerializerProtocol
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from jev.ledger import NullRecorder, Recorder
-from jev.models import State, Subgoal, TestOutcome
+from jev.models import (
+    CompileOutcome,
+    MechanicalCheckResult,
+    State,
+    Subgoal,
+    TestOutcome,
+    TestPolicy,
+    ValidationVerdict,
+)
 from jev.workspace import MainDivergedError, TrackedModificationsError, Workspace
+
+
+STATE_CUSTOM_TYPES = [
+    Subgoal,
+    MechanicalCheckResult,
+    ValidationVerdict,
+    TestOutcome,
+    CompileOutcome,
+    TestPolicy,
+]
 
 
 class SafeRecorder(NullRecorder):
@@ -116,8 +136,18 @@ def _normalize_compile_errors(compile_info: Optional[Dict[str, Any]]) -> List[Di
 class SqliteSaver(BaseCheckpointSaver):
     """SQLite-backed LangGraph checkpointer for persisting FSM state and strike counters."""
 
-    def __init__(self, conn: sqlite3.Connection):
-        super().__init__()
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        serde: Optional[SerializerProtocol] = None,
+    ):
+        if serde is None:
+            serde = JsonPlusSerializer(
+                allowed_msgpack_modules=STATE_CUSTOM_TYPES,
+                allowed_json_modules=STATE_CUSTOM_TYPES,
+            )
+        super().__init__(serde=serde)
         self.conn = conn
         self.lock = threading.RLock()
         self._setup()
@@ -178,11 +208,16 @@ class SqliteSaver(BaseCheckpointSaver):
                 cur.close()
 
     @classmethod
-    def from_conn_string(cls, conn_string: str) -> "SqliteSaver":
+    def from_conn_string(
+        cls,
+        conn_string: str,
+        *,
+        serde: Optional[SerializerProtocol] = None,
+    ) -> "SqliteSaver":
         if conn_string != ":memory:" and not conn_string.startswith("file:"):
             Path(conn_string).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(conn_string, check_same_thread=False)
-        return cls(conn)
+        return cls(conn, serde=serde)
 
     def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
         configurable = config.get("configurable", {})
@@ -3007,7 +3042,6 @@ class JevEngine:
                 f"Restarting thread from scratch and deleting prior integration branch (no resume)."
             )
             print(warning_msg, file=sys.stderr, flush=True)
-            print(warning_msg, flush=True)
 
         if self.workspace is not None and hasattr(self.workspace, "create_integration_branch"):
             self.workspace.create_integration_branch(integration_branch, base_commit=base_commit)

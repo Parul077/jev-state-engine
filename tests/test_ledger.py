@@ -567,3 +567,44 @@ def test_ledger_report_cli(tmp_path, capsys):
     assert "passed" in captured
     assert "0.95" in captured
     assert "jev-1.13.0" in captured
+
+
+def test_ledger_report_subprocess_without_pythonpath(tmp_path):
+    repo = _init_git_repo(tmp_path / "repo")
+    ledger_db = tmp_path / "ledger.db"
+    from jev.ledger import SqliteLedger
+
+    ledger = SqliteLedger(db_path=ledger_db)
+    run_id = "run-subp-test"
+    ledger.record_run_start(
+        run_id=run_id,
+        thread_id="thread-subp",
+        ticket="Subprocess report test ticket",
+        base_commit="abc1234",
+        engine_commit="def5678",
+        worker_model="dummy",
+        test_policy="auto",
+    )
+    ledger.record_run_end(
+        run_id=run_id,
+        final_status="completed",
+        final_commit="abc1234",
+        notes_chars=50,
+    )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    script_path = repo_root / "scripts" / "ledger_report.py"
+
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+
+    import sys
+    res = subprocess.run(
+        [sys.executable, str(script_path), "--db-path", str(ledger_db), "--run-id", run_id],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0
+    assert "Subprocess report test ticket" in res.stdout
