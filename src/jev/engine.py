@@ -132,6 +132,111 @@ def _normalize_compile_errors(compile_info: Optional[Dict[str, Any]]) -> List[Di
     return normalized
 
 
+def _extract_diff_excerpt(diff: Any, max_lines: int = 40, max_chars: int = 3000) -> str:
+    if not isinstance(diff, str) or not diff:
+        return ""
+    lines = diff.splitlines(keepends=True)
+    excerpt_lines = lines[:max_lines]
+    excerpt = "".join(excerpt_lines)
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars]
+    return excerpt
+
+
+def _record_failed_attempt_in_state(
+    state: State,
+    tier: str,
+    outcome: str,
+    failed_check: Optional[str],
+    diff: Any,
+    compile_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    if "failed_attempts" not in state or state["failed_attempts"] is None:
+        state["failed_attempts"] = []
+
+    prev_attempts = state["failed_attempts"]
+    attempt_no = (prev_attempts[-1].get("attempt_no", 0) + 1) if prev_attempts else 1
+    if isinstance(diff, str):
+        diff_bytes = diff.encode("utf-8")
+    elif isinstance(diff, bytes):
+        diff_bytes = diff
+    else:
+        diff_bytes = b""
+    diff_sha = hashlib.sha256(diff_bytes).hexdigest()
+    diff_excerpt = _extract_diff_excerpt(diff)
+
+    norm_errors = _normalize_compile_errors(compile_info)
+    norm_error_keys: List[str] = []
+    for err in norm_errors:
+        key = err.get("code") or err.get("message") or ""
+        if err.get("file"):
+            key = f"{err['file']}:{key}"
+        norm_error_keys.append(key)
+
+    entry = {
+        "attempt_no": attempt_no,
+        "tier": tier,
+        "failed_check": failed_check,
+        "outcome": outcome,
+        "normalized_error_keys": norm_error_keys,
+        "diff_sha": diff_sha,
+        "diff_excerpt": diff_excerpt,
+    }
+
+    state["failed_attempts"].append(entry)
+    if len(state["failed_attempts"]) > 2:
+        state["failed_attempts"] = state["failed_attempts"][-2:]
+
+
+def _format_typed_semantic_feedback(
+    verdict: ValidationVerdict,
+    subgoal: Subgoal,
+    diff: str,
+    tests_ran: bool,
+) -> str:
+    lines = ["Semantic validation rejected by Gatekeeper."]
+    if verdict.kind:
+        conf_str = f" (confidence: {verdict.kind_confidence:.2f})" if verdict.kind_confidence is not None else ""
+        lines.append(f"Main issue: {verdict.kind}{conf_str}")
+
+    flagged = []
+    if verdict.incomplete is not None and verdict.incomplete > 0.5:
+        flagged.append(f"Incomplete implementation (probability: {verdict.incomplete:.2f})")
+    if verdict.wrong_behavior is not None and verdict.wrong_behavior > 0.5:
+        flagged.append(f"Wrong behavior contradicting subgoal or ticket (probability: {verdict.wrong_behavior:.2f})")
+    if verdict.conflicts_with_notes is not None and verdict.conflicts_with_notes > 0.5:
+        flagged.append(f"Conflicts with investigation notes or conventions (probability: {verdict.conflicts_with_notes:.2f})")
+    if flagged:
+        lines.append("Flagged issues:")
+        for item in flagged:
+            lines.append(f"- {item}")
+
+    # Deterministic facts
+    files = []
+    if diff:
+        try:
+            files = sorted(list(Workspace._extract_files_from_diff(diff)))
+        except Exception:
+            files = []
+    scope_str = ", ".join(subgoal.scope) if subgoal.scope else "none"
+    files_str = ", ".join(files) if files else "none"
+    lines.append(f"Files touched: {files_str} (Declared scope: {scope_str})")
+
+    added = 0
+    removed = 0
+    if diff:
+        for dline in diff.splitlines():
+            if dline.startswith("+") and not dline.startswith("+++"):
+                added += 1
+            elif dline.startswith("-") and not dline.startswith("---"):
+                removed += 1
+    lines.append(f"Lines changed: +{added}, -{removed}")
+    lines.append(f"Tests ran: {'Yes' if tests_ran else 'No'}")
+
+    return "\n".join(lines)
+
+
+
 
 class SqliteSaver(BaseCheckpointSaver):
     """SQLite-backed LangGraph checkpointer for persisting FSM state and strike counters."""
@@ -1575,6 +1680,7 @@ def node_implement(
             current_subgoal = plan_queue.pop(0)
             state["current_subgoal"] = current_subgoal
             state["gate_status"] = None
+            state["failed_attempts"] = []
 
     subgoal: Optional[Subgoal] = None
     if isinstance(current_subgoal, dict):
@@ -1692,6 +1798,25 @@ def node_implement(
 
         if state.get("last_feedback"):
             prompt_lines.append(f"Previous attempt failed gate verification. Feedback:\n{state['last_feedback']}")
+
+        # Dead-end block (Phase 3 Item B)
+        retry_intel = state.get("retry_intel", "on")
+        if retry_intel != "off" and state.get("failed_attempts"):
+            block_lines = ["Earlier attempts at this subgoal failed. Do not repeat them."]
+            for fa in state["failed_attempts"]:
+                att_lines = [
+                    f"Attempt {fa.get('attempt_no', '?')} (Outcome: {fa.get('outcome')}, Failed check: {fa.get('failed_check')}):"
+                ]
+                if fa.get("diff_sha"):
+                    att_lines.append(f"Diff SHA: {fa['diff_sha']}")
+                errs = fa.get("normalized_error_keys") or fa.get("error_keys")
+                if errs:
+                    att_lines.append(f"Errors: {json.dumps(errs)}")
+                if fa.get("diff_excerpt"):
+                    att_lines.append(f"Diff excerpt:\n{fa['diff_excerpt']}")
+                block_lines.append("\n".join(att_lines))
+            prompt_lines.append("\n\n".join(block_lines))
+
 
         existing_files_context = []
         worktree = getattr(workspace, "worktree_dir", getattr(workspace, "repo_dir", None))
@@ -1981,7 +2106,15 @@ def _snapshot_attempt(
         return
     safe_rec = recorder if isinstance(recorder, SafeRecorder) else SafeRecorder(recorder)
     run_id = state.get("run_id") or state.get("thread_id") or "unknown"
-    diff_sha = hashlib.sha256(diff.encode("utf-8")).hexdigest() if diff else hashlib.sha256(b"").hexdigest()
+    if isinstance(diff, str):
+        diff_bytes = diff.encode("utf-8")
+    elif isinstance(diff, bytes):
+        diff_bytes = diff
+        diff = diff.decode("utf-8", errors="replace")
+    else:
+        diff_bytes = b""
+        diff = ""
+    diff_sha = hashlib.sha256(diff_bytes).hexdigest()
     files: List[str] = []
     if diff:
         try:
@@ -2024,8 +2157,8 @@ def _snapshot_attempt(
         jev_tokens_in=jev_tokens_in,
         jev_tokens_out=jev_tokens_out,
         feedback_sent=feedback_sent,
-        tokens_in=state.get("worker_tokens_in"),
-        tokens_out=state.get("worker_tokens_out"),
+        tokens_in=state.get("worker_tokens_in") if subgoal_id != "__verify__" else None,
+        tokens_out=state.get("worker_tokens_out") if subgoal_id != "__verify__" else None,
     )
 
 
@@ -2069,7 +2202,87 @@ def node_gate(
     run_id = state.get("run_id") or state.get("thread_id") or "unknown"
     subgoal_id = getattr(subgoal, "id", None) or "sg-1"
 
-    diff = workspace.get_staged_diff() if hasattr(workspace, "get_staged_diff") else ""
+    raw_diff = workspace.get_staged_diff() if hasattr(workspace, "get_staged_diff") else ""
+    if isinstance(raw_diff, str):
+        diff = raw_diff
+    elif isinstance(raw_diff, bytes):
+        diff = raw_diff.decode("utf-8", errors="replace")
+    else:
+        diff = ""
+    diff_sha = hashlib.sha256(diff.encode("utf-8")).hexdigest()
+
+    # Duplicate-diff guard (Phase 3 Item C)
+    retry_intel = state.get("retry_intel")
+    if retry_intel is None:
+        retry_intel = "on" if state.get("failed_attempts") is not None else "off"
+    if retry_intel != "off":
+        matching_fa = None
+        for fa in state.get("failed_attempts", []):
+            if fa.get("diff_sha") == diff_sha:
+                matching_fa = fa
+                break
+        if matching_fa is not None:
+            orig_tier = matching_fa.get("tier", "mechanical")
+            if orig_tier == "semantic":
+                current_strikes = state.get("semantic_strike_count", 0) + 1
+                state["semantic_strike_count"] = current_strikes
+                state["gate_status"] = "semantic_failure"
+            else:
+                current_strikes = state.get("mechanical_strike_count", 0) + 1
+                state["mechanical_strike_count"] = current_strikes
+                state["gate_status"] = "mechanical_failure"
+
+            prev_att_no = matching_fa.get("attempt_no", 1)
+            prev_reason = matching_fa.get("failed_check") or matching_fa.get("outcome") or "failure"
+            feedback_msg = (
+                f"Duplicate diff detected: identical to attempt {prev_att_no} which failed ({prev_reason}). "
+                "Do not submit identical diffs."
+            )
+            state["last_feedback"] = feedback_msg
+
+            _record_failed_attempt_in_state(
+                state,
+                tier=orig_tier,
+                outcome="duplicate_diff",
+                failed_check=matching_fa.get("failed_check"),
+                diff=diff,
+            )
+            _snapshot_attempt(
+                safe_rec,
+                state,
+                subgoal_id,
+                tier=orig_tier,
+                outcome="duplicate_diff",
+                failed_check=matching_fa.get("failed_check"),
+                diff=diff,
+                feedback_sent=feedback_msg,
+            )
+            _teardown_worktree(state, workspace)
+
+            state["trajectory"].append({
+                "node": "gate",
+                "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
+                "gate_status": "duplicate_diff",
+                "tier0_result": None,
+                "compile": None,
+                "test_runner": None,
+                "jev_request": None,
+                "jev_verdict": None,
+            })
+
+            if current_strikes >= 3:
+                subgoal.status = "failed"
+                state["current_subgoal"] = subgoal
+                if safe_rec:
+                    safe_rec.record_subgoal_status(run_id, subgoal_id, "failed")
+                _safe_escalate_deadlock(
+                    gatekeeper,
+                    trajectory=state.get("trajectory", []),
+                    triggering_tier=orig_tier,
+                    integration_branch=state.get("integration_branch"),
+                    thread_id=state.get("thread_id"),
+                )
+            return state
 
     # Tier 0: Mechanical checks
     subgoal_base_commit = state.get("subgoal_base_commit")
@@ -2148,6 +2361,15 @@ def node_gate(
             state["gate_status"] = mech_result.failed_check
             state["last_feedback"] = mech_result.detail
 
+            if retry_intel != "off":
+                _record_failed_attempt_in_state(
+                    state,
+                    tier="mechanical",
+                    outcome=mech_result.failed_check,
+                    failed_check=mech_result.failed_check,
+                    diff=diff,
+                    compile_info=compile_telemetry,
+                )
             _snapshot_attempt(
                 safe_rec,
                 state,
@@ -2195,9 +2417,33 @@ def node_gate(
                 compile_telemetry or getattr(mech_result, "compile_outcome", None) or {},
                 fallback_detail=mech_result.detail,
             )
+        elif mech_result.failed_check == "tests":
+            base_fb = mech_result.detail or "Unit tests failed."
+            output_tail = None
+            if isinstance(test_runner_telemetry, dict):
+                output_tail = test_runner_telemetry.get("output_tail")
+            elif hasattr(mech_result, "test_runner_outcome") and isinstance(mech_result.test_runner_outcome, dict):
+                output_tail = mech_result.test_runner_outcome.get("output_tail")
+            if output_tail:
+                tail_capped = output_tail[-4000:]
+                if tail_capped not in base_fb:
+                    state["last_feedback"] = f"{base_fb}\n\n{tail_capped}"
+                else:
+                    state["last_feedback"] = base_fb
+            else:
+                state["last_feedback"] = base_fb
         else:
             state["last_feedback"] = mech_result.detail
 
+        if retry_intel != "off":
+            _record_failed_attempt_in_state(
+                state,
+                tier="mechanical",
+                outcome="mechanical_failure",
+                failed_check=mech_result.failed_check,
+                diff=diff,
+                compile_info=compile_telemetry,
+            )
         _snapshot_attempt(
             safe_rec,
             state,
@@ -2384,6 +2630,8 @@ def node_gate(
         state["current_worktree_branch"] = None
         state["mechanical_strike_count"] = 0
         state["semantic_strike_count"] = 0
+        if "failed_attempts" in state or retry_intel != "off":
+            state["failed_attempts"] = []
         state["gate_status"] = "passed"
         state["last_feedback"] = ""
         subgoal.status = "committed"
@@ -2416,18 +2664,39 @@ def node_gate(
         })
         return state
     else:
-        prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
         current_sem_strikes = state.get("semantic_strike_count", 0) + 1
         state["semantic_strike_count"] = current_sem_strikes
         state["gate_status"] = "semantic_failure"
-        state["last_feedback"] = (
-            verdict.reason
-            or f"Semantic validation rejected by Gatekeeper{prob_str}. "
-               "Diff contradicted project conventions, exceeded declared scope, or failed to implement the required subgoal. "
-               "Ensure changes match the project architecture, dependencies, and styling in Investigation Notes. "
-               "Ensure changes strictly adhere to the application's actual domain, product identity, and branding documented in Investigation Notes, without introducing conflicting domain concepts, alternate sports/business models, or fabricated external entities."
-        )
 
+        has_extra_answers = (
+            getattr(verdict, "kind", None) is not None
+            or any(
+                getattr(verdict, attr, None) is not None
+                for attr in ("incomplete", "wrong_behavior", "conflicts_with_notes")
+            )
+        )
+        if retry_intel != "off" and has_extra_answers:
+            state["last_feedback"] = _format_typed_semantic_feedback(
+                verdict, subgoal, diff, tests_ran
+            )
+        else:
+            prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
+            state["last_feedback"] = (
+                verdict.reason
+                or f"Semantic validation rejected by Gatekeeper{prob_str}. "
+                   "Diff contradicted project conventions, exceeded declared scope, or failed to implement the required subgoal. "
+                   "Ensure changes match the project architecture, dependencies, and styling in Investigation Notes. "
+                   "Ensure changes strictly adhere to the application's actual domain, product identity, and branding documented in Investigation Notes, without introducing conflicting domain concepts, alternate sports/business models, or fabricated external entities."
+            )
+
+        if retry_intel != "off":
+            _record_failed_attempt_in_state(
+                state,
+                tier="semantic",
+                outcome="semantic_failure",
+                failed_check="jev_rejection",
+                diff=diff,
+            )
         _snapshot_attempt(
             safe_rec,
             state,
@@ -2651,6 +2920,16 @@ def node_verify(
                 test_runner_info = dict(test_runner_info)
                 test_runner_info["ran"] = True
 
+        if outcome == TestOutcome.FAILED or test_output == "FAILED":
+            output_tail = None
+            if isinstance(test_runner_info, dict):
+                output_tail = test_runner_info.get("output_tail")
+            elif hasattr(workspace, "last_test_run") and isinstance(workspace.last_test_run, dict):
+                output_tail = workspace.last_test_run.get("output_tail")
+            if output_tail:
+                tail_capped = output_tail[-4000:]
+                test_output = f"FAILED\n{tail_capped}"
+
         verdict = None
         if gatekeeper is not None and hasattr(gatekeeper, "verify_ticket"):
             if _accepts_param(gatekeeper.verify_ticket, "investigation_notes"):
@@ -2692,7 +2971,18 @@ def node_verify(
                 state["gate_status"] = "verification_failed"
                 state["status"] = "verification_failed"
                 prob_str = f" (confidence: {verdict.probability:.2f})" if hasattr(verdict, "probability") and isinstance(verdict.probability, (int, float)) else ""
-                state["last_feedback"] = verdict.reason or f"Verification rejected by Gatekeeper{prob_str}."
+                base_fb = verdict.reason or f"Verification rejected by Gatekeeper{prob_str}."
+                if outcome == TestOutcome.FAILED or "FAILED" in str(test_output):
+                    output_tail = None
+                    if isinstance(test_runner_info, dict):
+                        output_tail = test_runner_info.get("output_tail")
+                    elif hasattr(workspace, "last_test_run") and isinstance(workspace.last_test_run, dict):
+                        output_tail = workspace.last_test_run.get("output_tail")
+                    if output_tail:
+                        tail_capped = output_tail[-4000:]
+                        if tail_capped not in base_fb:
+                            base_fb = f"{base_fb}\n\nUnit tests failed:\n{tail_capped}"
+                state["last_feedback"] = base_fb
                 _snapshot_attempt(
                     safe_rec,
                     state,
@@ -2902,11 +3192,13 @@ class JevEngine:
         checkpointer: Optional[BaseCheckpointSaver] = None,
         test_policy: str = "auto",
         recorder: Optional[Any] = None,
+        retry_intel: str = "on",
     ):
         self.workspace = workspace
         self.gatekeeper = gatekeeper
         self.llm = llm
         self.test_policy = test_policy
+        self.retry_intel = retry_intel
         if recorder is None:
             self.recorder = SafeRecorder(NullRecorder())
         elif isinstance(recorder, SafeRecorder):
@@ -3061,6 +3353,7 @@ class JevEngine:
             engine_commit=engine_commit,
             worker_model=worker_model,
             test_policy=self.test_policy,
+            retry_intel=self.retry_intel,
         )
 
         initial_state: State = {
@@ -3071,6 +3364,8 @@ class JevEngine:
             "integration_branch": integration_branch,
             "subgoal_base_commit": base_commit,
             "test_policy": self.test_policy,
+            "retry_intel": self.retry_intel,
+            "failed_attempts": [],
             "plan_queue": [],
             "current_subgoal": None,
             "mechanical_strike_count": 0,

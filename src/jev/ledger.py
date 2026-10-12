@@ -53,7 +53,9 @@ class Recorder(Protocol):
         worker_model: Optional[str] = None,
         test_policy: Optional[str] = None,
         started_at: Optional[str] = None,
+        retry_intel: Optional[str] = None,
     ) -> None: ...
+
 
     def record_run_end(
         self,
@@ -126,8 +128,10 @@ class NullRecorder:
         worker_model: Optional[str] = None,
         test_policy: Optional[str] = None,
         started_at: Optional[str] = None,
+        retry_intel: Optional[str] = None,
     ) -> None:
         pass
+
 
     def record_run_end(
         self,
@@ -231,6 +235,7 @@ class SqliteLedger:
                   engine_commit TEXT,
                   worker_model TEXT,
                   test_policy TEXT,
+                  retry_intel TEXT,
                   evidence_level TEXT,
                   status TEXT,
                   started_at TEXT,
@@ -239,6 +244,13 @@ class SqliteLedger:
                 );
                 """
             )
+            # Additive migrations for existing databases
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()]
+            if "retry_intel" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN retry_intel TEXT DEFAULT 'on'")
+            if "notes_chars" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN notes_chars INTEGER")
+
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS subgoals (
@@ -300,6 +312,7 @@ class SqliteLedger:
         worker_model: Optional[str] = None,
         test_policy: Optional[str] = None,
         started_at: Optional[str] = None,
+        retry_intel: Optional[str] = None,
     ) -> None:
         start_time = started_at or datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
@@ -307,8 +320,8 @@ class SqliteLedger:
                 """
                 INSERT INTO runs (
                   run_id, thread_id, ticket, base_commit, engine_commit,
-                  worker_model, test_policy, status, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
+                  worker_model, test_policy, retry_intel, status, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                   thread_id=excluded.thread_id,
                   ticket=excluded.ticket,
@@ -316,6 +329,7 @@ class SqliteLedger:
                   engine_commit=excluded.engine_commit,
                   worker_model=excluded.worker_model,
                   test_policy=excluded.test_policy,
+                  retry_intel=excluded.retry_intel,
                   status='in_progress',
                   started_at=excluded.started_at
                 """,
@@ -327,9 +341,11 @@ class SqliteLedger:
                     engine_commit,
                     worker_model,
                     test_policy,
+                    retry_intel or "on",
                     start_time,
                 ),
             )
+
 
     def record_run_end(
         self,

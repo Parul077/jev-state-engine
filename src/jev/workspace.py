@@ -2667,17 +2667,20 @@ class Workspace:
                 test_runner_outcome=test_run_details,
             )
         elif should_run_tests and test_outcome == TestOutcome.FAILED:
+            output_tail = test_run_details.get("output_tail", "") if isinstance(test_run_details, dict) else ""
+            tail = output_tail[-4000:] if output_tail else ""
+            test_detail = f"Unit tests failed.\n{tail}" if tail else "Unit tests failed."
             return MechanicalCheckResult(
                 passed=False,
                 failed_check="tests",
-                detail="Unit tests failed.",
+                detail=test_detail,
                 checks_run=["build", "suppression", "unresolved_import", "compile", "tests"],
                 checks={
                     "build": {"ran": True, "passed": True, "detail": ""},
                     "suppression": {"ran": True, "passed": True, "detail": ""},
                     "unresolved_import": {"ran": True, "passed": True, "detail": ""},
                     "compile": {"ran": True, "passed": True, "detail": compile_res.get("detail", "")},
-                    "tests": {"ran": True, "passed": False, "detail": "Unit tests failed."},
+                    "tests": {"ran": True, "passed": False, "detail": test_detail},
                     "scope": {"ran": False, "passed": None},
                 },
                 compile_outcome=compile_res,

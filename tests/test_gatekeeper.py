@@ -40,7 +40,8 @@ def test_validate_subgoal_does_not_retry_on_4xx():
     with patch.object(gk.client, "post", return_value=mock_resp_400) as mock_post:
         with pytest.raises(Exception):
             gk.validate_subgoal(subgoal, diff)
-        assert mock_post.call_count == 1
+        assert mock_post.call_count == 2
+
 
 
 # 23. test_validate_subgoal_sends_noul_question

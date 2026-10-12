@@ -53,6 +53,13 @@ class ValidationVerdict(BaseModel):
     model: Optional[str] = None
     raw_response: Optional[Dict[str, Any]] = None
     usage: Optional[Dict[str, Any]] = None
+    kind: Optional[str] = None
+    kind_confidence: Optional[float] = None
+    kind_probabilities: Optional[Dict[str, float]] = None
+    incomplete: Optional[float] = None
+    wrong_behavior: Optional[float] = None
+    conflicts_with_notes: Optional[float] = None
+    extra_answers: Optional[Dict[str, Any]] = None
 
 
 class State(TypedDict, total=False):
@@ -78,5 +85,8 @@ class State(TypedDict, total=False):
     run_id: Optional[str]
     worker_tokens_in: Optional[int]
     worker_tokens_out: Optional[int]
+    failed_attempts: Optional[List[Dict[str, Any]]]
+    retry_intel: Optional[str]
+
 
 

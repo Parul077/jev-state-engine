@@ -127,29 +127,73 @@ class Gatekeeper:
         elif mechanical_detail:
             state["mechanical_detail"] = mechanical_detail
 
-        payload = {
-            "model": "jev-latest",
-            "state": state,
-            "questions": {
-                "valid": {
-                    "type": "noul",
-                    "instructions": "Does the diff fully and correctly implement the subgoal described in state, without exceeding its declared scope?",
-                }
+        questions = {
+            "valid": {
+                "type": "noul",
+                "instructions": "Does the diff fully and correctly implement the subgoal described in state, without exceeding its declared scope?",
+            },
+            "incomplete": {
+                "type": "noul",
+                "instructions": "Does the diff leave any part of the subgoal description unimplemented?",
+            },
+            "wrong_behavior": {
+                "type": "noul",
+                "instructions": "Does the diff implement behavior that contradicts the subgoal description or the ticket?",
+            },
+            "conflicts_with_notes": {
+                "type": "noul",
+                "instructions": "Does the diff contradict conventions or facts stated in the investigation notes?",
+            },
+            "kind": {
+                "type": "choice",
+                "instructions": "What is the main problem with this diff?",
+                "criteria": {
+                    "incomplete": "Part of the subgoal is not implemented",
+                    "wrong_behavior": "Behavior contradicts the subgoal or ticket",
+                    "conflicts_with_conventions": "Contradicts repository conventions or investigation notes",
+                    "low_quality": "Correct in intent but poorly executed",
+                    "fine": "No problem",
+                },
             },
         }
 
-        data = self._post_with_retry(payload)
+        payload = {
+            "model": "jev-latest",
+            "state": state,
+            "questions": questions,
+        }
+
+        try:
+            data = self._post_with_retry(payload)
+        except httpx.HTTPStatusError as e:
+            if 400 <= e.response.status_code < 500:
+                # Fall back to valid-only request
+                fallback_payload = {
+                    "model": "jev-latest",
+                    "state": state,
+                    "questions": {
+                        "valid": questions["valid"]
+                    },
+                }
+                data = self._post_with_retry(fallback_payload)
+            else:
+                raise
+
         return self._parse_noul_verdict(data)
 
     def _parse_noul_verdict(self, data: Dict[str, Any]) -> ValidationVerdict:
         valid_entry = None
+        answers_dict: Dict[str, Any] = {}
         if isinstance(data, dict):
             if "answers" in data and isinstance(data["answers"], dict):
-                valid_entry = data["answers"].get("valid")
+                answers_dict = data["answers"]
+                valid_entry = answers_dict.get("valid")
             elif "valid" in data:
+                answers_dict = data
                 valid_entry = data.get("valid")
             elif "questions" in data and isinstance(data["questions"], dict):
-                valid_entry = data["questions"].get("valid")
+                answers_dict = data["questions"]
+                valid_entry = answers_dict.get("valid")
 
         if not isinstance(valid_entry, dict):
             raise ValueError(f"Malformed response schema: missing 'valid' object in {data}")
@@ -159,6 +203,50 @@ class Gatekeeper:
         model_name = data.get("model") if isinstance(data, dict) else None
         usage = data.get("usage") if isinstance(data, dict) else None
         raw_resp = data if isinstance(data, dict) else None
+
+        # Parse extra answers (incomplete, wrong_behavior, conflicts_with_notes, kind)
+        def _parse_noul_prob(entry: Any) -> Optional[float]:
+            if isinstance(entry, dict):
+                if "noul" in entry and isinstance(entry["noul"], (int, float)):
+                    return float(entry["noul"])
+                if "probability" in entry and isinstance(entry["probability"], (int, float)):
+                    return float(entry["probability"])
+                if "value" in entry and isinstance(entry["value"], bool):
+                    return 1.0 if entry["value"] else 0.0
+            elif isinstance(entry, (int, float)):
+                return float(entry)
+            return None
+
+        incomplete_prob = _parse_noul_prob(answers_dict.get("incomplete"))
+        wrong_behavior_prob = _parse_noul_prob(answers_dict.get("wrong_behavior"))
+        conflicts_prob = _parse_noul_prob(answers_dict.get("conflicts_with_notes"))
+
+        kind_val: Optional[str] = None
+        kind_conf: Optional[float] = None
+        kind_probs: Optional[Dict[str, float]] = None
+        kind_entry = answers_dict.get("kind")
+        if isinstance(kind_entry, dict):
+            kind_val = (
+                kind_entry.get("choice")
+                or kind_entry.get("value")
+                or kind_entry.get("chosen")
+                or kind_entry.get("selected")
+            )
+            if kind_val is not None:
+                kind_val = str(kind_val)
+            conf = kind_entry.get("confidence") or kind_entry.get("probability")
+            if isinstance(conf, (int, float)):
+                kind_conf = float(conf)
+            probs = kind_entry.get("probabilities") or kind_entry.get("probs")
+            if isinstance(probs, dict):
+                kind_probs = {str(k): float(v) for k, v in probs.items() if isinstance(v, (int, float))}
+        elif isinstance(kind_entry, str):
+            kind_val = kind_entry
+
+        extra_answers = {}
+        for k in ("incomplete", "wrong_behavior", "conflicts_with_notes", "kind"):
+            if k in answers_dict:
+                extra_answers[k] = answers_dict[k]
 
         # Format 1: Mock / explicit format with 'value' and 'probability'
         if "value" in valid_entry and "probability" in valid_entry:
@@ -175,6 +263,13 @@ class Gatekeeper:
                 model=model_name,
                 raw_response=raw_resp,
                 usage=usage,
+                kind=kind_val,
+                kind_confidence=kind_conf,
+                kind_probabilities=kind_probs,
+                incomplete=incomplete_prob,
+                wrong_behavior=wrong_behavior_prob,
+                conflicts_with_notes=conflicts_prob,
+                extra_answers=extra_answers or None,
             )
 
         # Format 2: Real TypeSafe System One response with 'noul' probability
@@ -192,6 +287,13 @@ class Gatekeeper:
                 model=model_name,
                 raw_response=raw_resp,
                 usage=usage,
+                kind=kind_val,
+                kind_confidence=kind_conf,
+                kind_probabilities=kind_probs,
+                incomplete=incomplete_prob,
+                wrong_behavior=wrong_behavior_prob,
+                conflicts_with_notes=conflicts_prob,
+                extra_answers=extra_answers or None,
             )
 
         raise ValueError(f"Malformed response schema: missing required fields in {valid_entry}")

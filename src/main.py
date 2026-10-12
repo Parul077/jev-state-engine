@@ -62,7 +62,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Disable recording to SQLite ledger",
     )
+    parser.add_argument(
+        "--retry-intel",
+        choices=["on", "off"],
+        default="on",
+        help="Enable or disable retry intelligence (dead-end block, duplicate-diff guard, typed semantic feedback). Default: on.",
+    )
     return parser
+
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -115,7 +122,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         recorder=recorder,
         db_path=args.db_path,
         test_policy=args.test_policy,
+        retry_intel=args.retry_intel,
     )
+
 
     final_state = engine.execute(ticket=args.ticket, thread_id=args.thread_id)
 
