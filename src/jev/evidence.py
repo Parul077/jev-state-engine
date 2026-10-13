@@ -83,11 +83,16 @@ def format_evidence_summary(
 
     Wording must say tests did not run whenever the level has no tests.
     E.g. 'Evidence: compile-only (no tests ran: test_policy=verify-only)'
+    When evidence level is None:
+    'Evidence: not recorded (no committed subgoal, or ledger off)'
     """
+    if evidence_lvl is None:
+        return "Evidence: not recorded (no committed subgoal, or ledger off)"
+
     if evidence_lvl in ("tests+compile", "tests-only"):
         return f"Evidence: {evidence_lvl}"
 
-    lvl_str = evidence_lvl or "none"
+    lvl_str = evidence_lvl
     if test_policy:
         return f"Evidence: {lvl_str} (no tests ran: test_policy={test_policy})"
     return f"Evidence: {lvl_str} (no tests ran)"

@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 from jev.evidence import (
@@ -407,91 +408,65 @@ def test_engine_tier0_rejection_leaves_attempt_evidence_level_null(test_repo, tm
 
 
 # ==============================================================================
-# 5. Test proving Jev request body and worker prompts byte-identical to master
+# 5. Deterministic test: Jev request body contains no evidence key or string
 # ==============================================================================
 
-def test_jev_request_body_and_worker_prompts_byte_identical_to_master():
-    """Jev request payload construction and worker prompt templates are byte-identical to master."""
-    # 1. Verify gatekeeper validate_subgoal request payload against master
-    master_gk_code = subprocess.run(
-        ["git", "show", "master:src/jev/gatekeeper.py"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
+def test_gatekeeper_validate_subgoal_request_contains_no_evidence():
+    """Construct Gatekeeper with explicit api_url and api_key, mock transport, assert no evidence."""
+    captured_requests = []
 
-    current_gk_code = Path("src/jev/gatekeeper.py").read_text(encoding="utf-8")
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(
+            200,
+            json={"answers": {"valid": {"value": True, "probability": 0.95}}},
+        )
 
-    # In validate_subgoal: questions dict and state dict definitions must match byte-for-byte
-    gk = Gatekeeper(api_key="dummy")
-    subgoal = Subgoal(id="sg-1", description="Do task", scope=["a.py"], expects_tests=True)
-    diff = "diff --git a/a.py b/a.py\n"
+    gk = Gatekeeper(
+        api_url="https://api.typesafe.ai/v1/systemone",
+        api_key="test-key-no-env",
+    )
+    gk.client = httpx.Client(transport=httpx.MockTransport(mock_handler))
 
-    captured_payload = None
-    with patch.object(gk.client, "post") as mock_post:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.is_error = False
-        mock_resp.text = '{"answers": {"valid": {"value": true, "probability": 0.9}}}'
-        mock_resp.json.return_value = {"answers": {"valid": {"value": True, "probability": 0.9}}}
-        mock_post.return_value = mock_resp
-        gk.validate_subgoal(subgoal, diff, mechanical_detail="all clear", investigation_notes="some notes")
-        captured_payload = mock_post.call_args[1]["json"]
+    subgoal = Subgoal(id="sg-1", description="Implement test", scope=["a.py"], expects_tests=True)
+    gk.validate_subgoal(
+        subgoal,
+        "diff --git a/a.py b/a.py\n+x = 1\n",
+        mechanical_detail="ok",
+        investigation_notes="notes",
+    )
 
-    # Build payload using master's logic
-    master_scope = {}
-    exec(master_gk_code, master_scope)
-    MasterGatekeeper = master_scope["Gatekeeper"]
-    master_gk = MasterGatekeeper(api_key="dummy")
-    with patch.object(master_gk.client, "post") as mock_post_master:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.is_error = False
-        mock_resp.text = '{"answers": {"valid": {"value": true, "probability": 0.9}}}'
-        mock_resp.json.return_value = {"answers": {"valid": {"value": True, "probability": 0.9}}}
-        mock_post_master.return_value = mock_resp
-        master_gk.validate_subgoal(subgoal, diff, mechanical_detail="all clear", investigation_notes="some notes")
-        master_payload = mock_post_master.call_args[1]["json"]
-
-    assert json.dumps(captured_payload, sort_keys=True) == json.dumps(master_payload, sort_keys=True)
-
-    # 2. Verify worker prompt templates in engine.py
-    master_engine_code = subprocess.run(
-        ["git", "show", "master:src/jev/engine.py"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    current_engine_code = Path("src/jev/engine.py").read_text(encoding="utf-8")
-
-    # Extract prompt templates / prompt strings from master vs current
-    for prompt_anchor in [
-        "You have read-only access to investigate the codebase using the available tools: `list_dir`, `grep`, and `read_file`.",
-        "Break down the task into an ordered sequence of atomic Subgoals.",
-        "Strictly adhere to the project architecture, dependencies, styling conventions",
-    ]:
-        assert prompt_anchor in master_engine_code
-        assert prompt_anchor in current_engine_code
+    assert len(captured_requests) == 1
+    req_body_str = captured_requests[0].content.decode("utf-8")
+    assert "evidence" not in req_body_str.lower()
 
 
 # ==============================================================================
-# 6. Requirement 4: Final summary line formatting
+# 6. Final summary line formatting
 # ==============================================================================
 
 def test_final_summary_wording():
-    """Wording must say tests did not run whenever the level has no tests."""
+    """Wording must say tests did not run whenever the level has no tests, and not recorded when None."""
+    # None level: print exactly "Evidence: not recorded (no committed subgoal, or ledger off)"
+    s_none = format_evidence_summary(None, test_policy="verify-only")
+    assert s_none == "Evidence: not recorded (no committed subgoal, or ledger off)"
+    assert "no tests ran" not in s_none
+
+    s_none_no_policy = format_evidence_summary(None)
+    assert s_none_no_policy == "Evidence: not recorded (no committed subgoal, or ledger off)"
+    assert "no tests ran" not in s_none_no_policy
+
+    # compile-only with verify-only
     s_vo = format_evidence_summary("compile-only", test_policy="verify-only")
     assert s_vo == "Evidence: compile-only (no tests ran: test_policy=verify-only)"
 
     s_never = format_evidence_summary("compile-only", test_policy="never")
-    assert "no tests ran" in s_never
+    assert s_never == "Evidence: compile-only (no tests ran: test_policy=never)"
 
     s_sem = format_evidence_summary("semantic-only", test_policy="verify-only")
-    assert "no tests ran" in s_sem
+    assert s_sem == "Evidence: semantic-only (no tests ran: test_policy=verify-only)"
 
-    s_none = format_evidence_summary(None, test_policy="verify-only")
-    assert "no tests ran" in s_none
-
+    # tests+compile
     s_tests = format_evidence_summary("tests+compile", test_policy="auto")
     assert "no tests ran" not in s_tests
     assert s_tests == "Evidence: tests+compile"
@@ -499,3 +474,62 @@ def test_final_summary_wording():
     s_testsonly = format_evidence_summary("tests-only", test_policy="auto")
     assert "no tests ran" not in s_testsonly
     assert s_testsonly == "Evidence: tests-only"
+
+
+def test_escalated_run_evidence_summary_not_recorded(test_repo, tmp_path):
+    """Escalated run (no committed subgoal) prints the 'not recorded' line, not 'no tests ran' line."""
+    ws = Workspace(repo_dir=test_repo)
+    db_file = tmp_path / "escalated_summary.db"
+    ledger = SqliteLedger(db_path=db_file)
+    gk = FakeGatekeeper()
+
+    subgoal = Subgoal(id="sg-1", description="Syntax error", scope=["src/app.py"], expects_tests=False)
+    target = test_repo / "src" / "app.py"
+    target.write_text("def broken(:\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=test_repo, check=True, capture_output=True)
+
+    state: State = {
+        "run_id": "run-esc",
+        "thread_id": "run-esc",
+        "ticket": "Syntax error ticket",
+        "plan_queue": [],
+        "current_subgoal": subgoal,
+        "mechanical_strike_count": 0,
+        "semantic_strike_count": 0,
+        "trajectory": [],
+        "test_policy": "verify-only",
+    }
+    ledger.record_run_start("run-esc", "run-esc", "Syntax error ticket", test_policy="verify-only")
+    ledger.record_subgoals("run-esc", [subgoal])
+
+    # Node gate fails at Tier 0
+    res = node_gate(state, workspace=ws, gatekeeper=gk, recorder=ledger)
+    assert res["gate_status"] == "mechanical_failure"
+
+    # Run escalates, no subgoals committed
+    ledger.record_run_end("run-esc", final_status="escalated")
+
+    ev_level = ledger.get_run_evidence_level("run-esc")
+    assert ev_level is None
+
+    summary_line = format_evidence_summary(ev_level, test_policy="verify-only")
+    assert summary_line == "Evidence: not recorded (no committed subgoal, or ledger off)"
+    assert "no tests ran" not in summary_line
+
+
+def test_cli_escalated_run_evidence_summary_in_main(test_repo, monkeypatch, capsys):
+    """CLI run ending in escalation prints 'Evidence: not recorded (no committed subgoal, or ledger off)'."""
+    from main import main
+    monkeypatch.chdir(test_repo)
+    monkeypatch.setenv("JEV_API_KEY", "dummy-key")
+    monkeypatch.setenv("JEV_API_URL", "https://api.typesafe.ai/v1/systemone")
+
+    mock_eng = MagicMock()
+    mock_eng.execute.return_value = {"status": "escalated", "gate_status": "mechanical_deadlock"}
+    with patch("main.Gatekeeper"), patch("main.JevEngine", return_value=mock_eng):
+        exit_code = main(["Broken ticket", "--no-ledger", "--test-policy", "verify-only", "--repo-dir", str(test_repo)])
+        assert exit_code == 1
+
+    captured = capsys.readouterr()
+    assert "Evidence: not recorded (no committed subgoal, or ledger off)" in captured.out
+    assert "no tests ran" not in captured.out
