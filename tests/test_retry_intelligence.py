@@ -476,8 +476,7 @@ def test_typed_semantic_feedback_fine_omits_main_issue():
     )
     feedback = _format_typed_semantic_feedback(verdict, subgoal, diff, tests_ran=True)
     assert "Main issue" not in feedback
-    assert "No specific issue identified by the judge" in feedback
-    assert "rejection probability: 0.15" in feedback
+    assert "No specific issue identified by the judge (validity probability: 0.15, pass needs 0.50)" in feedback
 
 
 def test_gatekeeper_fallback_only_on_400_or_422_and_remembers():

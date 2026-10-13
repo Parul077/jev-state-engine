@@ -197,7 +197,7 @@ def _format_typed_semantic_feedback(
     lines = ["Semantic validation rejected by Gatekeeper."]
     if verdict.kind:
         if verdict.kind == "fine":
-            prob_str = f" (rejection probability: {verdict.probability:.2f})" if getattr(verdict, "probability", None) is not None else ""
+            prob_str = f" (validity probability: {verdict.probability:.2f}, pass needs 0.50)" if getattr(verdict, "probability", None) is not None else ""
             lines.append(f"No specific issue identified by the judge{prob_str}")
         else:
             conf_str = f" (confidence: {verdict.kind_confidence:.2f})" if verdict.kind_confidence is not None else ""
