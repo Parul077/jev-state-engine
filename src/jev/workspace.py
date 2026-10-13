@@ -440,6 +440,153 @@ ECOSYSTEM_COMPILE_HANDLERS = [
 ]
 
 
+@dataclass(frozen=True)
+class ResolvedTestCommand:
+    ecosystem: Optional[str]
+    command: Optional[List[str]]
+    source: str
+    reason: Optional[str] = None
+
+
+def resolve_test_command(wt: Union[str, Path]) -> ResolvedTestCommand:
+    """Detects the test command from repository manifests without running subprocesses or writing files.
+
+    Returns a ResolvedTestCommand with ecosystem, command (list or None), source (rule/file matched),
+    and reason (explanation if command is None).
+    """
+    wt = Path(wt)
+
+    # 1. package.json test script
+    pkg_json_path = wt / "package.json"
+    if pkg_json_path.exists():
+        try:
+            pkg_data = json.loads(pkg_json_path.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(pkg_data, dict):
+                scripts = pkg_data.get("scripts")
+                if isinstance(scripts, dict) and "test" in scripts:
+                    if (wt / "yarn.lock").exists():
+                        return ResolvedTestCommand(ecosystem="yarn", command=["yarn", "test"], source="package.json")
+                    elif (wt / "pnpm-lock.yaml").exists():
+                        return ResolvedTestCommand(ecosystem="pnpm", command=["pnpm", "test"], source="package.json")
+                    else:
+                        return ResolvedTestCommand(ecosystem="npm", command=["npm", "test"], source="package.json")
+        except Exception as e:
+            return ResolvedTestCommand(
+                ecosystem="package_json",
+                command=None,
+                source="package.json",
+                reason=f"Failed to parse package.json: {e}",
+            )
+
+    # 2. go.mod
+    if (wt / "go.mod").exists():
+        return ResolvedTestCommand(ecosystem="go", command=["go", "test", "./..."], source="go.mod")
+
+    # 3. Cargo.toml
+    if (wt / "Cargo.toml").exists():
+        return ResolvedTestCommand(ecosystem="cargo", command=["cargo", "test"], source="Cargo.toml")
+
+    # 4. pom.xml
+    if (wt / "pom.xml").exists():
+        mvn_cmd = "mvn"
+        if sys.platform == "win32" and (wt / "mvnw.cmd").exists():
+            mvn_cmd = str(wt / "mvnw.cmd")
+        elif (wt / "mvnw").exists():
+            mvn_cmd = "./mvnw"
+        elif (wt / "mvnw.cmd").exists():
+            mvn_cmd = str(wt / "mvnw.cmd")
+        return ResolvedTestCommand(ecosystem="maven", command=[mvn_cmd, "test"], source="pom.xml")
+
+    # 5. build.gradle / build.gradle.kts
+    if (wt / "build.gradle").exists() or (wt / "build.gradle.kts").exists():
+        gradle_cmd = "gradle"
+        if sys.platform == "win32" and (wt / "gradlew.bat").exists():
+            gradle_cmd = str(wt / "gradlew.bat")
+        elif (wt / "gradlew").exists():
+            gradle_cmd = "./gradlew"
+        elif (wt / "gradlew.bat").exists():
+            gradle_cmd = str(wt / "gradlew.bat")
+        source = "build.gradle" if (wt / "build.gradle").exists() else "build.gradle.kts"
+        return ResolvedTestCommand(ecosystem="gradle", command=[gradle_cmd, "test"], source=source)
+
+    # 6. pytest signals
+    has_pytest = False
+    pytest_source = None
+    if (wt / "pytest.ini").exists():
+        has_pytest = True
+        pytest_source = "pytest.ini"
+    elif (wt / "pyproject.toml").exists():
+        try:
+            pyproj_text = (wt / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
+            if "[tool.pytest" in pyproj_text:
+                has_pytest = True
+                pytest_source = "pyproject.toml"
+        except Exception:
+            pass
+    if not has_pytest:
+        try:
+            has_pytest = (
+                any(wt.glob("test_*.py"))
+                or any(wt.glob("*_test.py"))
+                or ((wt / "tests").is_dir() and (any((wt / "tests").glob("*.py")) or any((wt / "tests").rglob("*.py"))))
+            )
+            if has_pytest:
+                pytest_source = "python_test_files"
+        except Exception:
+            pass
+
+    if has_pytest:
+        return ResolvedTestCommand(
+            ecosystem="pytest",
+            command=[sys.executable, "-m", "pytest", "-q"],
+            source=pytest_source or "pytest",
+        )
+
+    # 7. IaC signals
+    # Terraform
+    has_tf = False
+    try:
+        has_tf = any(wt.glob("*.tf")) or any(p for p in wt.rglob("*.tf") if ".terraform" not in p.parts)
+    except Exception:
+        pass
+
+    if has_tf:
+        return ResolvedTestCommand(ecosystem="terraform", command=["terraform", "validate"], source="terraform")
+
+    # Ansible
+    has_ansible = (
+        (wt / "ansible.cfg").exists()
+        or (wt / "playbooks").is_dir()
+        or any(wt.glob("playbook*.yml"))
+        or any(wt.glob("playbook*.yaml"))
+    )
+    if has_ansible:
+        if shutil.which("ansible-lint"):
+            return ResolvedTestCommand(ecosystem="ansible", command=["ansible-lint"], source="ansible")
+        elif shutil.which("ansible-playbook"):
+            playbooks = list(wt.glob("playbook*.yml")) + list(wt.glob("playbook*.yaml"))
+            pb_arg = str(playbooks[0]) if playbooks else "."
+            return ResolvedTestCommand(
+                ecosystem="ansible",
+                command=["ansible-playbook", "--syntax-check", pb_arg],
+                source="ansible",
+            )
+        else:
+            return ResolvedTestCommand(ecosystem="ansible", command=["ansible-lint"], source="ansible")
+
+    # Helm
+    if (wt / "Chart.yaml").exists():
+        return ResolvedTestCommand(ecosystem="helm", command=["helm", "lint", "."], source="Chart.yaml")
+
+    # 8. Fallback
+    return ResolvedTestCommand(
+        ecosystem=None,
+        command=None,
+        source="none",
+        reason="No test framework or test files detected",
+    )
+
+
 class Workspace:
     SUPPRESSION_DIRECTIVES = SUPPRESSION_DIRECTIVES
     UNRESOLVED_IMPORT_RESOLVERS = UNRESOLVED_IMPORT_RESOLVERS
@@ -1075,56 +1222,30 @@ class Workspace:
                 )
         return BuildCheckResult(passed=True, detail="")
 
+    def resolve_test_command(self) -> ResolvedTestCommand:
+        return resolve_test_command(self.worktree_dir)
+
     def run_tests(self) -> TestOutcome:
         wt = self.worktree_dir
+        res = resolve_test_command(wt)
 
-        # 1. package.json test script
-        pkg_json_path = wt / "package.json"
-        if pkg_json_path.exists():
-            try:
-                pkg_data = json.loads(pkg_json_path.read_text(encoding="utf-8", errors="replace"))
-                if isinstance(pkg_data, dict):
-                    scripts = pkg_data.get("scripts")
-                    if isinstance(scripts, dict) and "test" in scripts:
-                        if (wt / "yarn.lock").exists():
-                            cmd = ["yarn", "test"]
-                            ecosystem = "yarn"
-                        elif (wt / "pnpm-lock.yaml").exists():
-                            cmd = ["pnpm", "test"]
-                            ecosystem = "pnpm"
-                        else:
-                            cmd = ["npm", "test"]
-                            ecosystem = "npm"
-                        resolved = shutil.which(cmd[0])
-                        if not resolved:
-                            return self._record_test_run(
-                                ecosystem, cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
-                            )
-                        exec_cmd = [resolved] + cmd[1:]
-                        res = subprocess.run(
-                            exec_cmd,
-                            cwd=wt,
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                        )
-                        outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                        return self._record_test_run(ecosystem, cmd, res.returncode, res.stdout, res.stderr, outcome)
-            except Exception as e:
-                return self._record_test_run("package_json", None, -1, "", str(e), TestOutcome.FAILED)
+        if res.command is None:
+            if res.ecosystem == "package_json" and res.reason:
+                return self._record_test_run("package_json", None, -1, "", res.reason, TestOutcome.FAILED)
+            return self._record_test_run(None, None, None, "", "", TestOutcome.NO_TESTS_COLLECTED)
 
-        # 2. go.mod
-        if (wt / "go.mod").exists():
-            cmd = ["go", "test", "./..."]
+        cmd = res.command
+        ecosystem = res.ecosystem
+
+        if ecosystem in ("yarn", "pnpm", "npm", "go", "cargo", "maven", "gradle"):
             resolved = shutil.which(cmd[0])
             if not resolved:
                 return self._record_test_run(
-                    "go", cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
+                    ecosystem, cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
                 )
             exec_cmd = [resolved] + cmd[1:]
             try:
-                res = subprocess.run(
+                sub_res = subprocess.run(
                     exec_cmd,
                     cwd=wt,
                     capture_output=True,
@@ -1132,119 +1253,14 @@ class Workspace:
                     encoding="utf-8",
                     errors="replace",
                 )
-                outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                return self._record_test_run("go", cmd, res.returncode, res.stdout, res.stderr, outcome)
+                outcome = TestOutcome.PASSED if sub_res.returncode == 0 else TestOutcome.FAILED
+                return self._record_test_run(ecosystem, cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)
             except Exception as e:
-                return self._record_test_run("go", cmd, -1, "", str(e), TestOutcome.FAILED)
+                return self._record_test_run(ecosystem, cmd, -1, "", str(e), TestOutcome.FAILED)
 
-        # 3. Cargo.toml
-        if (wt / "Cargo.toml").exists():
-            cmd = ["cargo", "test"]
-            resolved = shutil.which(cmd[0])
-            if not resolved:
-                return self._record_test_run(
-                    "cargo", cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
-                )
-            exec_cmd = [resolved] + cmd[1:]
+        elif ecosystem == "pytest":
             try:
-                res = subprocess.run(
-                    exec_cmd,
-                    cwd=wt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                return self._record_test_run("cargo", cmd, res.returncode, res.stdout, res.stderr, outcome)
-            except Exception as e:
-                return self._record_test_run("cargo", cmd, -1, "", str(e), TestOutcome.FAILED)
-
-        # 4. pom.xml
-        if (wt / "pom.xml").exists():
-            mvn_cmd = "mvn"
-            if sys.platform == "win32" and (wt / "mvnw.cmd").exists():
-                mvn_cmd = str(wt / "mvnw.cmd")
-            elif (wt / "mvnw").exists():
-                mvn_cmd = "./mvnw"
-            elif (wt / "mvnw.cmd").exists():
-                mvn_cmd = str(wt / "mvnw.cmd")
-            cmd = [mvn_cmd, "test"]
-            resolved = shutil.which(cmd[0])
-            if not resolved:
-                return self._record_test_run(
-                    "maven", cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
-                )
-            exec_cmd = [resolved] + cmd[1:]
-            try:
-                res = subprocess.run(
-                    exec_cmd,
-                    cwd=wt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                return self._record_test_run("maven", cmd, res.returncode, res.stdout, res.stderr, outcome)
-            except Exception as e:
-                return self._record_test_run("maven", cmd, -1, "", str(e), TestOutcome.FAILED)
-
-        # 5. build.gradle / build.gradle.kts
-        if (wt / "build.gradle").exists() or (wt / "build.gradle.kts").exists():
-            gradle_cmd = "gradle"
-            if sys.platform == "win32" and (wt / "gradlew.bat").exists():
-                gradle_cmd = str(wt / "gradlew.bat")
-            elif (wt / "gradlew").exists():
-                gradle_cmd = "./gradlew"
-            elif (wt / "gradlew.bat").exists():
-                gradle_cmd = str(wt / "gradlew.bat")
-            cmd = [gradle_cmd, "test"]
-            resolved = shutil.which(cmd[0])
-            if not resolved:
-                return self._record_test_run(
-                    "gradle", cmd, None, "", f"Executable '{cmd[0]}' not found.", TestOutcome.ENV_NOT_READY
-                )
-            exec_cmd = [resolved] + cmd[1:]
-            try:
-                res = subprocess.run(
-                    exec_cmd,
-                    cwd=wt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                return self._record_test_run("gradle", cmd, res.returncode, res.stdout, res.stderr, outcome)
-            except Exception as e:
-                return self._record_test_run("gradle", cmd, -1, "", str(e), TestOutcome.FAILED)
-
-        # 6. pytest signals
-        has_pytest = False
-        if (wt / "pytest.ini").exists():
-            has_pytest = True
-        elif (wt / "pyproject.toml").exists():
-            try:
-                pyproj_text = (wt / "pyproject.toml").read_text(encoding="utf-8", errors="replace")
-                if "[tool.pytest" in pyproj_text:
-                    has_pytest = True
-            except Exception:
-                pass
-        if not has_pytest:
-            try:
-                has_pytest = (
-                    any(wt.glob("test_*.py"))
-                    or any(wt.glob("*_test.py"))
-                    or ((wt / "tests").is_dir() and (any((wt / "tests").glob("*.py")) or any((wt / "tests").rglob("*.py"))))
-                )
-            except Exception:
-                pass
-
-        if has_pytest:
-            cmd = [sys.executable, "-m", "pytest", "-q"]
-            try:
-                res = subprocess.run(
+                sub_res = subprocess.run(
                     cmd,
                     cwd=wt,
                     capture_output=True,
@@ -1252,29 +1268,20 @@ class Workspace:
                     encoding="utf-8",
                     errors="replace",
                 )
-                if res.returncode == 0:
+                if sub_res.returncode == 0:
                     outcome = TestOutcome.PASSED
-                elif res.returncode == 5:
+                elif sub_res.returncode == 5:
                     outcome = TestOutcome.NO_TESTS_COLLECTED
                 else:
                     outcome = TestOutcome.FAILED
-                return self._record_test_run("pytest", cmd, res.returncode, res.stdout, res.stderr, outcome)
+                return self._record_test_run("pytest", cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)
             except Exception as e:
                 return self._record_test_run("pytest", cmd, -1, "", str(e), TestOutcome.FAILED)
 
-        # 7. IaC signals
-        # Terraform
-        has_tf = False
-        try:
-            has_tf = any(wt.glob("*.tf")) or any(p for p in wt.rglob("*.tf") if ".terraform" not in p.parts)
-        except Exception:
-            pass
-
-        if has_tf:
+        elif ecosystem == "terraform":
             if shutil.which("terraform"):
-                cmd = ["terraform", "validate"]
                 try:
-                    res = subprocess.run(
+                    sub_res = subprocess.run(
                         cmd,
                         cwd=wt,
                         capture_output=True,
@@ -1282,26 +1289,18 @@ class Workspace:
                         encoding="utf-8",
                         errors="replace",
                     )
-                    outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                    return self._record_test_run("terraform", cmd, res.returncode, res.stdout, res.stderr, outcome)
+                    outcome = TestOutcome.PASSED if sub_res.returncode == 0 else TestOutcome.FAILED
+                    return self._record_test_run("terraform", cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)
                 except Exception as e:
                     return self._record_test_run("terraform", cmd, -1, "", str(e), TestOutcome.FAILED)
             return self._record_test_run(
-                "terraform", ["terraform", "validate"], None, "", "Executable 'terraform' not found.", TestOutcome.ENV_NOT_READY
+                "terraform", cmd, None, "", "Executable 'terraform' not found.", TestOutcome.ENV_NOT_READY
             )
 
-        # Ansible
-        has_ansible = (
-            (wt / "ansible.cfg").exists()
-            or (wt / "playbooks").is_dir()
-            or any(wt.glob("playbook*.yml"))
-            or any(wt.glob("playbook*.yaml"))
-        )
-        if has_ansible:
-            if shutil.which("ansible-lint"):
-                cmd = ["ansible-lint"]
+        elif ecosystem == "ansible":
+            if shutil.which("ansible-lint") or shutil.which("ansible-playbook"):
                 try:
-                    res = subprocess.run(
+                    sub_res = subprocess.run(
                         cmd,
                         cwd=wt,
                         capture_output=True,
@@ -1309,37 +1308,18 @@ class Workspace:
                         encoding="utf-8",
                         errors="replace",
                     )
-                    outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                    return self._record_test_run("ansible", cmd, res.returncode, res.stdout, res.stderr, outcome)
-                except Exception as e:
-                    return self._record_test_run("ansible", cmd, -1, "", str(e), TestOutcome.FAILED)
-            elif shutil.which("ansible-playbook"):
-                playbooks = list(wt.glob("playbook*.yml")) + list(wt.glob("playbook*.yaml"))
-                pb_arg = str(playbooks[0]) if playbooks else "."
-                cmd = ["ansible-playbook", "--syntax-check", pb_arg]
-                try:
-                    res = subprocess.run(
-                        cmd,
-                        cwd=wt,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                    )
-                    outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                    return self._record_test_run("ansible", cmd, res.returncode, res.stdout, res.stderr, outcome)
+                    outcome = TestOutcome.PASSED if sub_res.returncode == 0 else TestOutcome.FAILED
+                    return self._record_test_run("ansible", cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)
                 except Exception as e:
                     return self._record_test_run("ansible", cmd, -1, "", str(e), TestOutcome.FAILED)
             return self._record_test_run(
-                "ansible", ["ansible-lint"], None, "", "Executable 'ansible-lint' not found.", TestOutcome.ENV_NOT_READY
+                "ansible", cmd, None, "", "Executable 'ansible-lint' not found.", TestOutcome.ENV_NOT_READY
             )
 
-        # Helm
-        if (wt / "Chart.yaml").exists():
-            cmd = ["helm", "lint", "."]
+        elif ecosystem == "helm":
             if shutil.which("helm"):
                 try:
-                    res = subprocess.run(
+                    sub_res = subprocess.run(
                         cmd,
                         cwd=wt,
                         capture_output=True,
@@ -1347,15 +1327,14 @@ class Workspace:
                         encoding="utf-8",
                         errors="replace",
                     )
-                    outcome = TestOutcome.PASSED if res.returncode == 0 else TestOutcome.FAILED
-                    return self._record_test_run("helm", cmd, res.returncode, res.stdout, res.stderr, outcome)
+                    outcome = TestOutcome.PASSED if sub_res.returncode == 0 else TestOutcome.FAILED
+                    return self._record_test_run("helm", cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)
                 except Exception as e:
                     return self._record_test_run("helm", cmd, -1, "", str(e), TestOutcome.FAILED)
             return self._record_test_run(
                 "helm", cmd, None, "", "Executable 'helm' not found.", TestOutcome.ENV_NOT_READY
             )
 
-        # 8. Fallback
         return self._record_test_run(None, None, None, "", "", TestOutcome.NO_TESTS_COLLECTED)
 
 
