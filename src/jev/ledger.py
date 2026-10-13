@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Union
 
+from jev.evidence import weakest
 from jev.models import Subgoal
 
 
@@ -64,6 +65,7 @@ class Recorder(Protocol):
         final_commit: Optional[str] = None,
         ended_at: Optional[str] = None,
         notes_chars: Optional[int] = None,
+        evidence_level: Optional[str] = None,
     ) -> None: ...
 
     def record_subgoals(
@@ -110,9 +112,12 @@ class Recorder(Protocol):
         tokens_in: Optional[int] = None,
         tokens_out: Optional[int] = None,
         created_at: Optional[str] = None,
+        evidence_level: Optional[str] = None,
     ) -> None: ...
 
     def has_run(self, run_id: str) -> bool: ...
+
+    def get_run_evidence_level(self, run_id: str) -> Optional[str]: ...
 
 
 class NullRecorder:
@@ -140,6 +145,7 @@ class NullRecorder:
         final_commit: Optional[str] = None,
         ended_at: Optional[str] = None,
         notes_chars: Optional[int] = None,
+        evidence_level: Optional[str] = None,
     ) -> None:
         pass
 
@@ -190,11 +196,15 @@ class NullRecorder:
         tokens_in: Optional[int] = None,
         tokens_out: Optional[int] = None,
         created_at: Optional[str] = None,
+        evidence_level: Optional[str] = None,
     ) -> None:
         pass
 
     def has_run(self, run_id: str) -> bool:
         return False
+
+    def get_run_evidence_level(self, run_id: str) -> Optional[str]:
+        return None
 
 
 class SqliteLedger:
@@ -248,6 +258,8 @@ class SqliteLedger:
             cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()]
             if "retry_intel" not in cols:
                 conn.execute("ALTER TABLE runs ADD COLUMN retry_intel TEXT DEFAULT NULL")
+            if "evidence_level" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN evidence_level TEXT DEFAULT NULL")
             if "notes_chars" not in cols:
                 conn.execute("ALTER TABLE runs ADD COLUMN notes_chars INTEGER")
 
@@ -292,10 +304,14 @@ class SqliteLedger:
                   tokens_in INTEGER,
                   tokens_out INTEGER,
                   created_at TEXT,
+                  evidence_level TEXT,
                   PRIMARY KEY (run_id, subgoal_id, attempt_no)
                 );
                 """
             )
+            att_cols = [r[1] for r in conn.execute("PRAGMA table_info(attempts)").fetchall()]
+            if "evidence_level" not in att_cols:
+                conn.execute("ALTER TABLE attempts ADD COLUMN evidence_level TEXT DEFAULT NULL")
 
     def has_run(self, run_id: str) -> bool:
         with self._get_connection() as conn:
@@ -354,19 +370,41 @@ class SqliteLedger:
         final_commit: Optional[str] = None,
         ended_at: Optional[str] = None,
         notes_chars: Optional[int] = None,
+        evidence_level: Optional[str] = None,
     ) -> None:
         end_time = ended_at or datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
+            if evidence_level is None:
+                rows = conn.execute(
+                    """
+                    SELECT a.evidence_level
+                    FROM attempts a
+                    JOIN subgoals s ON a.run_id = s.run_id AND a.subgoal_id = s.subgoal_id
+                    WHERE a.run_id = ? AND s.status = 'committed'
+                      AND a.attempt_no = (
+                          SELECT MAX(attempt_no) FROM attempts
+                          WHERE run_id = a.run_id AND subgoal_id = a.subgoal_id
+                      )
+                    ORDER BY s.ordinal
+                    """,
+                    (run_id,),
+                ).fetchall()
+                if rows:
+                    evidence_level = weakest([r[0] for r in rows])
+                else:
+                    evidence_level = None
+
             conn.execute(
                 """
                 UPDATE runs SET
                   status = ?,
                   final_commit = ?,
                   ended_at = ?,
-                  notes_chars = ?
+                  notes_chars = ?,
+                  evidence_level = ?
                 WHERE run_id = ?
                 """,
-                (final_status, final_commit, end_time, notes_chars, run_id),
+                (final_status, final_commit, end_time, notes_chars, evidence_level, run_id),
             )
 
     def record_subgoals(
@@ -461,6 +499,7 @@ class SqliteLedger:
         tokens_in: Optional[int] = None,
         tokens_out: Optional[int] = None,
         created_at: Optional[str] = None,
+        evidence_level: Optional[str] = None,
     ) -> None:
         now_ts = created_at or datetime.now(timezone.utc).isoformat()
         if not diff_sha:
@@ -490,8 +529,9 @@ class SqliteLedger:
                   tests_ran, test_outcome,
                   jev_valid, jev_probability, jev_model, jev_raw,
                   jev_tokens_in, jev_tokens_out,
-                  feedback_sent, tokens_in, tokens_out, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  feedback_sent, tokens_in, tokens_out, created_at,
+                  evidence_level
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -516,5 +556,11 @@ class SqliteLedger:
                     tokens_in,
                     tokens_out,
                     now_ts,
+                    evidence_level,
                 ),
             )
+
+    def get_run_evidence_level(self, run_id: str) -> Optional[str]:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT evidence_level FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            return row[0] if row else None

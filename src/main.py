@@ -7,6 +7,7 @@ from typing import List, Optional
 from dotenv import dotenv_values
 
 from jev.engine import JevEngine
+from jev.evidence import format_evidence_summary
 from jev.gatekeeper import Gatekeeper
 from jev.ledger import NullRecorder, SqliteLedger
 from jev.workspace import Workspace
@@ -130,6 +131,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     status = final_state.get("status")
     gate_status = final_state.get("gate_status")
+
+    ev_level = None
+    if hasattr(recorder, "get_run_evidence_level"):
+        ev_level = recorder.get_run_evidence_level(args.thread_id)
+    print(format_evidence_summary(ev_level, test_policy=args.test_policy))
 
     if status == "escalated":
         print(f"[ESCALATION] Engine halted. Triggering status: {gate_status}")

@@ -29,6 +29,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from jev.evidence import evidence_level
 from jev.ledger import NullRecorder, Recorder
 from jev.models import (
     CompileOutcome,
@@ -2102,6 +2103,7 @@ def _snapshot_attempt(
     test_outcome: Optional[str] = None,
     verdict: Optional[Any] = None,
     feedback_sent: Optional[str] = None,
+    evidence_level: Optional[str] = None,
 ) -> None:
     """Helper to snapshot an attempt row to the ledger."""
     if not recorder:
@@ -2161,6 +2163,7 @@ def _snapshot_attempt(
         feedback_sent=feedback_sent,
         tokens_in=state.get("worker_tokens_in") if subgoal_id != "__verify__" else None,
         tokens_out=state.get("worker_tokens_out") if subgoal_id != "__verify__" else None,
+        evidence_level=evidence_level,
     )
 
 
@@ -2490,6 +2493,12 @@ def node_gate(
     if gatekeeper is None:
         raise ValueError("Gatekeeper must be provided for Tier 1 validation.")
 
+    ev_level = evidence_level(
+        compile_outcome=compile_telemetry,
+        test_outcome=test_runner_telemetry,
+        test_policy=state.get("test_policy"),
+    )
+
     inv_notes = state.get("investigation_notes")
     if _accepts_param(gatekeeper.validate_subgoal, "investigation_notes"):
         verdict = gatekeeper.validate_subgoal(
@@ -2528,7 +2537,7 @@ def node_gate(
                 state["last_feedback"] = err_msg
                 _snapshot_attempt(
                     safe_rec, state, subgoal_id, tier="merge", outcome="merge_failed",
-                    diff=diff, feedback_sent=err_msg
+                    diff=diff, feedback_sent=err_msg, evidence_level=ev_level
                 )
                 _teardown_worktree(state, workspace)
                 subgoal.status = "failed"
@@ -2570,7 +2579,7 @@ def node_gate(
                 state["last_feedback"] = f"Worktree merge failed: {e}"
                 _snapshot_attempt(
                     safe_rec, state, subgoal_id, tier="merge", outcome="merge_failed",
-                    diff=diff, feedback_sent=str(e)
+                    diff=diff, feedback_sent=str(e), evidence_level=ev_level
                 )
                 _teardown_worktree(state, workspace)
                 subgoal.status = "failed"
@@ -2595,7 +2604,7 @@ def node_gate(
             err_msg = "Worktree was created but worktree state was missing or invalid at gate time."
             _snapshot_attempt(
                 safe_rec, state, subgoal_id, tier="worktree", outcome="worktree_state_missing",
-                diff=diff, feedback_sent=err_msg
+                diff=diff, feedback_sent=err_msg, evidence_level=ev_level
             )
             _teardown_worktree(state, workspace)
             subgoal.status = "failed"
@@ -2650,6 +2659,7 @@ def node_gate(
             tests_ran=tests_ran,
             test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
             feedback_sent="",
+            evidence_level=ev_level,
         )
         if safe_rec:
             safe_rec.record_subgoal_committed(run_id, subgoal_id, parent_sha=parent_sha, commit_sha=commit_sha)
@@ -2710,6 +2720,7 @@ def node_gate(
             tests_ran=tests_ran,
             test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
             feedback_sent=state.get("last_feedback"),
+            evidence_level=ev_level,
         )
         _teardown_worktree(state, workspace)
 
@@ -2956,6 +2967,11 @@ def node_verify(
                 state["gate_status"] = "verified"
                 state["status"] = "completed"
                 state["last_feedback"] = ""
+                verify_ev_level = evidence_level(
+                    compile_outcome=compile_info,
+                    test_outcome=test_runner_info,
+                    test_policy=state.get("test_policy"),
+                )
                 _snapshot_attempt(
                     safe_rec,
                     state,
@@ -2968,6 +2984,7 @@ def node_verify(
                     test_outcome=test_runner_info.get("outcome") if isinstance(test_runner_info, dict) else test_output,
                     verdict=verdict,
                     feedback_sent="",
+                    evidence_level=verify_ev_level,
                 )
             else:
                 state["gate_status"] = "verification_failed"
@@ -2985,6 +3002,11 @@ def node_verify(
                         if tail_capped not in base_fb:
                             base_fb = f"{base_fb}\n\nUnit tests failed:\n{tail_capped}"
                 state["last_feedback"] = base_fb
+                verify_ev_level = evidence_level(
+                    compile_outcome=compile_info,
+                    test_outcome=test_runner_info,
+                    test_policy=state.get("test_policy"),
+                )
                 _snapshot_attempt(
                     safe_rec,
                     state,
@@ -2997,6 +3019,7 @@ def node_verify(
                     test_outcome=test_runner_info.get("outcome") if isinstance(test_runner_info, dict) else test_output,
                     verdict=verdict,
                     feedback_sent=state.get("last_feedback"),
+                    evidence_level=verify_ev_level,
                 )
         else:
             if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
@@ -3008,6 +3031,11 @@ def node_verify(
                 workspace.delete_integration_branch(integration_branch)
             state["gate_status"] = "verified"
             state["status"] = "completed"
+            verify_ev_level = evidence_level(
+                compile_outcome=compile_info,
+                test_outcome=test_runner_info,
+                test_policy=state.get("test_policy"),
+            )
             _snapshot_attempt(
                 safe_rec,
                 state,
@@ -3020,6 +3048,7 @@ def node_verify(
                 test_outcome=test_runner_info.get("outcome") if isinstance(test_runner_info, dict) else test_output,
                 verdict=None,
                 feedback_sent="",
+                evidence_level=verify_ev_level,
             )
 
         verify_entry: Dict[str, Any] = {
