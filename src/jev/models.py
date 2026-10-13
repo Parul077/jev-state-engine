@@ -87,6 +87,8 @@ class State(TypedDict, total=False):
     worker_tokens_out: Optional[int]
     failed_attempts: Optional[List[Dict[str, Any]]]
     retry_intel: Optional[str]
+    repo_profile: Optional[str]
+    repo_profile_text: Optional[str]
 
 
 

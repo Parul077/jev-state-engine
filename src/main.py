@@ -69,6 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="on",
         help="Enable or disable retry intelligence (dead-end block, duplicate-diff guard, typed semantic feedback). Default: on.",
     )
+    parser.add_argument(
+        "--repo-profile",
+        choices=["on", "off"],
+        default="off",
+        help="Inject repository profile into plan and implement prompts (on, off; defaults to off).",
+    )
     return parser
 
 
@@ -124,6 +130,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         db_path=args.db_path,
         test_policy=args.test_policy,
         retry_intel=args.retry_intel,
+        repo_profile=args.repo_profile,
     )
 
 

@@ -55,6 +55,8 @@ class Recorder(Protocol):
         test_policy: Optional[str] = None,
         started_at: Optional[str] = None,
         retry_intel: Optional[str] = None,
+        repo_profile: Optional[str] = None,
+        profile_chars: Optional[int] = None,
     ) -> None: ...
 
 
@@ -134,6 +136,8 @@ class NullRecorder:
         test_policy: Optional[str] = None,
         started_at: Optional[str] = None,
         retry_intel: Optional[str] = None,
+        repo_profile: Optional[str] = None,
+        profile_chars: Optional[int] = None,
     ) -> None:
         pass
 
@@ -246,6 +250,8 @@ class SqliteLedger:
                   worker_model TEXT,
                   test_policy TEXT,
                   retry_intel TEXT,
+                  repo_profile TEXT,
+                  profile_chars INTEGER,
                   evidence_level TEXT,
                   status TEXT,
                   started_at TEXT,
@@ -262,6 +268,10 @@ class SqliteLedger:
                 conn.execute("ALTER TABLE runs ADD COLUMN evidence_level TEXT DEFAULT NULL")
             if "notes_chars" not in cols:
                 conn.execute("ALTER TABLE runs ADD COLUMN notes_chars INTEGER")
+            if "repo_profile" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN repo_profile TEXT DEFAULT NULL")
+            if "profile_chars" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN profile_chars INTEGER DEFAULT NULL")
 
             conn.execute(
                 """
@@ -329,6 +339,8 @@ class SqliteLedger:
         test_policy: Optional[str] = None,
         started_at: Optional[str] = None,
         retry_intel: Optional[str] = None,
+        repo_profile: Optional[str] = None,
+        profile_chars: Optional[int] = None,
     ) -> None:
         start_time = started_at or datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
@@ -336,8 +348,8 @@ class SqliteLedger:
                 """
                 INSERT INTO runs (
                   run_id, thread_id, ticket, base_commit, engine_commit,
-                  worker_model, test_policy, retry_intel, status, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
+                  worker_model, test_policy, retry_intel, repo_profile, profile_chars, status, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                   thread_id=excluded.thread_id,
                   ticket=excluded.ticket,
@@ -346,6 +358,8 @@ class SqliteLedger:
                   worker_model=excluded.worker_model,
                   test_policy=excluded.test_policy,
                   retry_intel=excluded.retry_intel,
+                  repo_profile=excluded.repo_profile,
+                  profile_chars=excluded.profile_chars,
                   status='in_progress',
                   started_at=excluded.started_at
                 """,
@@ -358,6 +372,8 @@ class SqliteLedger:
                     worker_model,
                     test_policy,
                     retry_intel or "on",
+                    repo_profile or "off",
+                    profile_chars,
                     start_time,
                 ),
             )

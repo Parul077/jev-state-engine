@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 import json
+import logging
 import re
 import sqlite3
 import subprocess
@@ -41,6 +42,8 @@ from jev.models import (
     ValidationVerdict,
 )
 from jev.workspace import MainDivergedError, TrackedModificationsError, Workspace
+
+logger = logging.getLogger(__name__)
 
 
 STATE_CUSTOM_TYPES = [
@@ -1498,6 +1501,11 @@ def node_plan(
             "in the files and directories that were successfully discovered."
         )
 
+    if state.get("repo_profile") == "on" and state.get("repo_profile_text"):
+        prompt_lines.append(
+            f"\nRepository Profile (hard facts detected from manifests, not guesses):\n{state['repo_profile_text']}"
+        )
+
     prompt_lines.extend([
         "",
         "Instructions:",
@@ -1799,6 +1807,11 @@ def node_implement(
         if state.get("investigation_notes"):
             prompt_lines.append(
                 f"Investigation Notes (Project Architecture & Conventions):\n{state['investigation_notes']}"
+            )
+
+        if state.get("repo_profile") == "on" and state.get("repo_profile_text"):
+            prompt_lines.append(
+                f"Repository Profile (hard facts detected from manifests, not guesses):\n{state['repo_profile_text']}"
             )
 
         if state.get("last_feedback"):
@@ -3224,12 +3237,14 @@ class JevEngine:
         test_policy: str = "auto",
         recorder: Optional[Any] = None,
         retry_intel: str = "on",
+        repo_profile: str = "off",
     ):
         self.workspace = workspace
         self.gatekeeper = gatekeeper
         self.llm = llm
         self.test_policy = test_policy
         self.retry_intel = retry_intel
+        self.repo_profile = repo_profile
         if recorder is None:
             self.recorder = SafeRecorder(NullRecorder())
         elif isinstance(recorder, SafeRecorder):
@@ -3375,6 +3390,22 @@ class JevEngine:
             if not worker_model and hasattr(self.llm, "__class__"):
                 worker_model = self.llm.__class__.__name__
 
+        profile_text = None
+        profile_chars = None
+        if self.repo_profile == "on":
+            try:
+                from jev.repo_profile import get_or_build_repo_profile
+
+                main_repo_dir = self.workspace.repo_dir if self.workspace is not None else Path.cwd()
+                prof = get_or_build_repo_profile(main_repo_dir)
+                rendered = prof.to_prompt_text()
+                profile_text = rendered if rendered else None
+                profile_chars = len(rendered) if rendered else None
+            except Exception as e:
+                logger.warning(f"{type(e).__name__}: {e}")
+                profile_text = None
+                profile_chars = None
+
         engine_commit = _get_engine_commit()
         self.recorder.record_run_start(
             run_id=run_id,
@@ -3385,6 +3416,8 @@ class JevEngine:
             worker_model=worker_model,
             test_policy=self.test_policy,
             retry_intel=self.retry_intel,
+            repo_profile=self.repo_profile,
+            profile_chars=profile_chars,
         )
 
         initial_state: State = {
@@ -3396,6 +3429,8 @@ class JevEngine:
             "subgoal_base_commit": base_commit,
             "test_policy": self.test_policy,
             "retry_intel": self.retry_intel,
+            "repo_profile": self.repo_profile,
+            "repo_profile_text": profile_text,
             "failed_attempts": [],
             "plan_queue": [],
             "current_subgoal": None,
