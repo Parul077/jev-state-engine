@@ -257,10 +257,12 @@ tokio = "1"
     (web / "package.json").write_text(
         json.dumps({
             "name": "web",
+            "scripts": {"typecheck": "tsc", "test": "jest"},
             "dependencies": {"next": "14.0.0", "react": "18.2.0"},
         })
     )
     (web / "package-lock.json").write_text("{}")
+    (web / "node_modules").mkdir()
 
     prof = build_repo_profile(repo)
     assert len(prof.ecosystems) == 2
@@ -268,12 +270,40 @@ tokio = "1"
     eco_rust = prof.ecosystems[0]
     assert eco_rust.root == "."
     assert eco_rust.ecosystem == "rust"
+    assert eco_rust.compile_status == "command"
+    assert eco_rust.compile_command == ["cargo", "check"]
 
     eco_js = prof.ecosystems[1]
     assert eco_js.root == "apps/web"
     assert eco_js.ecosystem == "js_ts"
     assert eco_js.package_manager == "npm"
+    assert eco_js.compile_status == "not_gated"
+    assert eco_js.compile_command is None
+    assert eco_js.test_command is None
+    assert eco_js.test_source is None
     assert eco_js.frameworks == ["next", "react"]
+
+    prompt_text = prof.to_prompt_text()
+    assert "not run by the gate" in prompt_text
+    assert "js_ts @ apps/web: npm, cjs; not run by the gate; frameworks: next, react" in prompt_text
+
+
+def test_pytest_interpreter_prompt_text(tmp_path):
+    """Tests that to_prompt_text() prints python -m pytest -q while stored test_command is unchanged."""
+    import sys
+    repo = tmp_path / "py_pytest"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text('[project]\nname="my-pkg"\n')
+    (repo / "pytest.ini").write_text("[pytest]\n")
+
+    prof = build_repo_profile(repo)
+    assert len(prof.ecosystems) == 1
+    eco = prof.ecosystems[0]
+    assert eco.test_command == [sys.executable, "-m", "pytest", "-q"]
+
+    prompt_text = prof.to_prompt_text()
+    assert "tests: python -m pytest -q" in prompt_text
+    assert sys.executable not in prompt_text
 
 
 def test_compile_command_equals_handler_return(tmp_path):

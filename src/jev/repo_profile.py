@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Set, Tuple, Union
 
@@ -142,7 +143,7 @@ class EcosystemProfile(BaseModel):
     package_manager: str
     module_system: Optional[str] = None
     compile_command: Optional[List[str]] = None
-    compile_status: Literal["command", "no_compile_command", "env_not_ready", "syntax_check_only"]
+    compile_status: Literal["command", "no_compile_command", "env_not_ready", "syntax_check_only", "not_gated"]
     test_command: Optional[List[str]] = None
     test_source: Optional[str] = None
     frameworks: List[str] = Field(default_factory=list)
@@ -163,6 +164,15 @@ class RepositoryProfile(BaseModel):
             else:
                 pm_mod = eco.package_manager
 
+            if eco.frameworks:
+                frameworks_part = ", ".join(eco.frameworks)
+            else:
+                frameworks_part = "none"
+
+            if eco.compile_status == "not_gated":
+                lines.append(f"{prefix}{pm_mod}; not run by the gate; frameworks: {frameworks_part}")
+                continue
+
             if eco.compile_command:
                 compile_part = " ".join(eco.compile_command)
             elif eco.compile_status == "syntax_check_only":
@@ -173,14 +183,15 @@ class RepositoryProfile(BaseModel):
                 compile_part = "none"
 
             if eco.test_command:
-                test_part = " ".join(eco.test_command)
+                test_cmd = list(eco.test_command)
+                if test_cmd and (
+                    test_cmd[0] == sys.executable
+                    or os.path.normcase(test_cmd[0]) == os.path.normcase(sys.executable)
+                ):
+                    test_cmd[0] = "python"
+                test_part = " ".join(test_cmd)
             else:
                 test_part = "none"
-
-            if eco.frameworks:
-                frameworks_part = ", ".join(eco.frameworks)
-            else:
-                frameworks_part = "none"
 
             lines.append(f"{prefix}{pm_mod}; compile: {compile_part}; tests: {test_part}; frameworks: {frameworks_part}")
         return "\n".join(lines)
@@ -515,8 +526,14 @@ def build_repo_profile(repo_dir: Union[str, Path]) -> RepositoryProfile:
                 pm = "unknown"
                 module_system = None
 
-            compile_cmd, compile_status = _detect_compile(eco_name, r)
-            test_cmd, test_source = _detect_test(eco_name, r)
+            if rel_r != ".":
+                compile_cmd = None
+                compile_status = "not_gated"
+                test_cmd = None
+                test_source = None
+            else:
+                compile_cmd, compile_status = _detect_compile(eco_name, r)
+                test_cmd, test_source = _detect_test(eco_name, r)
             frameworks = _detect_frameworks(eco_name, r)
 
             eco_profile = EcosystemProfile(
