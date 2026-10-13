@@ -247,7 +247,7 @@ class SqliteLedger:
             # Additive migrations for existing databases
             cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()]
             if "retry_intel" not in cols:
-                conn.execute("ALTER TABLE runs ADD COLUMN retry_intel TEXT DEFAULT 'on'")
+                conn.execute("ALTER TABLE runs ADD COLUMN retry_intel TEXT DEFAULT NULL")
             if "notes_chars" not in cols:
                 conn.execute("ALTER TABLE runs ADD COLUMN notes_chars INTEGER")
 

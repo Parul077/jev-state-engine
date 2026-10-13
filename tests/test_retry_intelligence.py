@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 from jev.models import Subgoal, MechanicalCheckResult, ValidationVerdict, State, TestOutcome
-from jev.engine import node_gate, node_implement, node_verify, JevEngine
+from jev.engine import node_gate, node_implement, node_verify, JevEngine, _format_typed_semantic_feedback
 from jev.gatekeeper import Gatekeeper
 from jev.ledger import SqliteLedger, NullRecorder
 
@@ -198,6 +198,7 @@ def test_dead_end_block_in_implement_prompt():
     assert "Earlier attempts at this subgoal failed. Do not repeat them." in prompt_str
     assert "Attempt 1" in prompt_str
     assert "bad_code" in prompt_str
+    assert "Diff SHA:" not in prompt_str
 
 
 def test_dead_end_block_absent_when_retry_intel_off():
@@ -463,6 +464,68 @@ def test_4xx_extended_request_retries_once_with_valid_only():
         assert verdict.kind is None
 
 
+def test_typed_semantic_feedback_fine_omits_main_issue():
+    """When kind is 'fine', omit 'Main issue' and write 'No specific issue identified by the judge' plus rejection probability."""
+    subgoal = Subgoal(id="sg-1", description="Implement auth", scope=["auth.py"], expects_tests=True)
+    diff = "diff --git a/auth.py b/auth.py\n+x = 1\n"
+    verdict = ValidationVerdict(
+        valid=False,
+        probability=0.15,
+        kind="fine",
+        kind_confidence=0.92,
+    )
+    feedback = _format_typed_semantic_feedback(verdict, subgoal, diff, tests_ran=True)
+    assert "Main issue" not in feedback
+    assert "No specific issue identified by the judge" in feedback
+    assert "rejection probability: 0.15" in feedback
+
+
+def test_gatekeeper_fallback_only_on_400_or_422_and_remembers():
+    """Fall back to valid-only request only on 400 or 422. Do not fall back on 401, 403, 429 or 5xx.
+    After one fallback, remember it on instance and send valid-only directly on later calls."""
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    subgoal = Subgoal(description="Add feature", scope=["feat.py"], expects_tests=True)
+    diff = "diff --git a/feat.py b/feat.py\n+x = 1\n"
+
+    # 1. Fallback on 422, succeeds on fallback, and remembers valid-only mode
+    resp_422 = httpx.Response(422, json={"error": "Unprocessable Entity"})
+    resp_200 = httpx.Response(200, json={"answers": {"valid": {"noul": 0.85}}})
+
+    with patch.object(gk.client, "post", side_effect=[resp_422, resp_200]) as mock_post:
+        verdict = gk.validate_subgoal(subgoal, diff)
+        assert mock_post.call_count == 2
+        assert "kind" in mock_post.call_args_list[0][1]["json"]["questions"]
+        assert list(mock_post.call_args_list[1][1]["json"]["questions"].keys()) == ["valid"]
+        assert verdict.valid is True
+        assert getattr(gk, "_valid_only_mode", False) is True
+
+    # Subsequent call on same instance should send valid-only directly (1 call)
+    with patch.object(gk.client, "post", return_value=resp_200) as mock_post:
+        verdict2 = gk.validate_subgoal(subgoal, diff)
+        assert mock_post.call_count == 1
+        assert list(mock_post.call_args[1]["json"]["questions"].keys()) == ["valid"]
+        assert verdict2.valid is True
+
+    # 2. Do not fall back on 401, 403, 429
+    for code in (401, 403, 429):
+        fresh_gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+        resp_err = httpx.Response(code, json={"error": "Auth/Rate error"})
+        with patch.object(fresh_gk.client, "post", return_value=resp_err) as mock_post:
+            with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                fresh_gk.validate_subgoal(subgoal, diff)
+            assert exc_info.value.response.status_code == code
+            assert mock_post.call_count == 1  # No fallback attempted
+
+    # Do not fall back on 5xx error
+    fresh_gk_500 = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key", max_retries=1)
+    resp_500 = httpx.Response(500, json={"error": "Server error"})
+    with patch.object(fresh_gk_500.client, "post", return_value=resp_500) as mock_post:
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            fresh_gk_500.validate_subgoal(subgoal, diff)
+        assert exc_info.value.response.status_code == 500
+        assert mock_post.call_count == 1  # No fallback attempted
+
+
 # ==========================================
 # E. Switch (--retry-intel on|off) & Migration
 # ==========================================
@@ -501,6 +564,29 @@ def test_ledger_additive_migration_for_existing_db(tmp_path):
     row = conn.execute("SELECT retry_intel FROM runs WHERE run_id = 'run-1'").fetchone()
     conn.close()
     assert row[0] == "off"
+
+
+def test_ledger_additive_migration_null_default_no_backfill(tmp_path):
+    """Additive migration sets retry_intel DEFAULT NULL for existing rows without backfill."""
+    db_file = tmp_path / "legacy_ledger_null.db"
+    conn = sqlite3.connect(str(db_file))
+    conn.execute("""
+    CREATE TABLE runs (
+      run_id TEXT PRIMARY KEY, thread_id TEXT, ticket TEXT,
+      base_commit TEXT, final_commit TEXT, engine_commit TEXT,
+      worker_model TEXT, test_policy TEXT,
+      status TEXT, started_at TEXT, ended_at TEXT, notes_chars INTEGER
+    )
+    """)
+    conn.execute("INSERT INTO runs (run_id, thread_id, ticket) VALUES ('run-legacy', 't-leg', 'ticket-leg')")
+    conn.commit()
+    conn.close()
+
+    ledger = SqliteLedger(db_path=db_file)
+    conn = sqlite3.connect(str(db_file))
+    row = conn.execute("SELECT retry_intel FROM runs WHERE run_id = 'run-legacy'").fetchone()
+    conn.close()
+    assert row[0] is None
 
 
 # ==========================================

@@ -196,8 +196,12 @@ def _format_typed_semantic_feedback(
 ) -> str:
     lines = ["Semantic validation rejected by Gatekeeper."]
     if verdict.kind:
-        conf_str = f" (confidence: {verdict.kind_confidence:.2f})" if verdict.kind_confidence is not None else ""
-        lines.append(f"Main issue: {verdict.kind}{conf_str}")
+        if verdict.kind == "fine":
+            prob_str = f" (rejection probability: {verdict.probability:.2f})" if getattr(verdict, "probability", None) is not None else ""
+            lines.append(f"No specific issue identified by the judge{prob_str}")
+        else:
+            conf_str = f" (confidence: {verdict.kind_confidence:.2f})" if verdict.kind_confidence is not None else ""
+            lines.append(f"Main issue: {verdict.kind}{conf_str}")
 
     flagged = []
     if verdict.incomplete is not None and verdict.incomplete > 0.5:
@@ -1807,8 +1811,6 @@ def node_implement(
                 att_lines = [
                     f"Attempt {fa.get('attempt_no', '?')} (Outcome: {fa.get('outcome')}, Failed check: {fa.get('failed_check')}):"
                 ]
-                if fa.get("diff_sha"):
-                    att_lines.append(f"Diff SHA: {fa['diff_sha']}")
                 errs = fa.get("normalized_error_keys") or fa.get("error_keys")
                 if errs:
                     att_lines.append(f"Errors: {json.dumps(errs)}")

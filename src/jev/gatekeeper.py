@@ -49,6 +49,7 @@ class Gatekeeper:
         self.backoff_factor = backoff_factor
         self.timeout = timeout
         self.client = httpx.Client(timeout=self.timeout)
+        self._valid_only_mode: bool = False
 
     def _post_with_retry(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         headers = {
@@ -157,6 +158,17 @@ class Gatekeeper:
             },
         }
 
+        if self._valid_only_mode:
+            fallback_payload = {
+                "model": "jev-latest",
+                "state": state,
+                "questions": {
+                    "valid": questions["valid"]
+                },
+            }
+            data = self._post_with_retry(fallback_payload)
+            return self._parse_noul_verdict(data)
+
         payload = {
             "model": "jev-latest",
             "state": state,
@@ -166,8 +178,8 @@ class Gatekeeper:
         try:
             data = self._post_with_retry(payload)
         except httpx.HTTPStatusError as e:
-            if 400 <= e.response.status_code < 500:
-                # Fall back to valid-only request
+            if e.response.status_code in (400, 422):
+                self._valid_only_mode = True
                 fallback_payload = {
                     "model": "jev-latest",
                     "state": state,
