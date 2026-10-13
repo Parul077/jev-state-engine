@@ -1,4 +1,5 @@
 import inspect
+import logging
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -377,6 +378,156 @@ def test_verify_ticket_instructions_contextual_when_investigation_notes_present(
         inst = payload["questions"]["valid"]["instructions"]
         assert "does the final diff completely resolve the ticket" in inst.lower()
         assert "untested pass" in inst.lower()
+
+
+# ==========================================
+# Housekeeping-2: Gatekeeper fallback warning
+# ==========================================
+
+def test_gatekeeper_fallback_warning_400(caplog):
+    """1. 400 then success: exactly one warning, containing '400', the body text, and the word 'valid-only'."""
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    subgoal = Subgoal(description="Add feature", scope=["feat.py"], expects_tests=True)
+    diff = "diff --git a/feat.py b/feat.py\n+x = 1\n"
+
+    err_body = '{"error": "Question type choice not supported"}'
+    resp_400 = httpx.Response(400, text=err_body)
+    resp_200 = httpx.Response(200, json={"answers": {"valid": {"noul": 0.85}}})
+
+    with caplog.at_level(logging.WARNING):
+        with patch.object(gk.client, "post", side_effect=[resp_400, resp_200]):
+            verdict = gk.validate_subgoal(subgoal, diff)
+
+    assert verdict.valid is True
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    msg = warnings[0].message
+    assert "400" in msg
+    assert err_body in msg
+    assert "valid-only" in msg
+
+
+def test_gatekeeper_fallback_warning_422(caplog):
+    """2. 422: same as test 1 with '422'."""
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    subgoal = Subgoal(description="Add feature", scope=["feat.py"], expects_tests=True)
+    diff = "diff --git a/feat.py b/feat.py\n+x = 1\n"
+
+    err_body = '{"error": "Unprocessable entity in payload"}'
+    resp_422 = httpx.Response(422, text=err_body)
+    resp_200 = httpx.Response(200, json={"answers": {"valid": {"noul": 0.85}}})
+
+    with caplog.at_level(logging.WARNING):
+        with patch.object(gk.client, "post", side_effect=[resp_422, resp_200]):
+            verdict = gk.validate_subgoal(subgoal, diff)
+
+    assert verdict.valid is True
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    msg = warnings[0].message
+    assert "422" in msg
+    assert err_body in msg
+    assert "valid-only" in msg
+
+
+def test_gatekeeper_fallback_warning_once_only(caplog):
+    """3. A second validate_subgoal call after the fallback: no additional warning (still exactly one total)."""
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    subgoal = Subgoal(description="Add feature", scope=["feat.py"], expects_tests=True)
+    diff = "diff --git a/feat.py b/feat.py\n+x = 1\n"
+
+    resp_400 = httpx.Response(400, text="Bad request")
+    resp_200 = httpx.Response(200, json={"answers": {"valid": {"noul": 0.85}}})
+
+    with caplog.at_level(logging.WARNING):
+        with patch.object(gk.client, "post", side_effect=[resp_400, resp_200, resp_200]):
+            gk.validate_subgoal(subgoal, diff)
+            gk.validate_subgoal(subgoal, diff)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+
+
+def test_gatekeeper_fallback_warning_body_truncated_to_500(caplog):
+    """4. A response body longer than 500 chars is truncated to 500 in the log."""
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+    subgoal = Subgoal(description="Add feature", scope=["feat.py"], expects_tests=True)
+    diff = "diff --git a/feat.py b/feat.py\n+x = 1\n"
+
+    prefix = "A" * 500
+    suffix = "Z" * 100
+    long_body = prefix + suffix
+    resp_400 = httpx.Response(400, text=long_body)
+    resp_200 = httpx.Response(200, json={"answers": {"valid": {"noul": 0.85}}})
+
+    with caplog.at_level(logging.WARNING):
+        with patch.object(gk.client, "post", side_effect=[resp_400, resp_200]):
+            gk.validate_subgoal(subgoal, diff)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    msg = warnings[0].message
+    assert prefix in msg
+    assert suffix not in msg
+
+
+def test_gatekeeper_no_fallback_warning_on_other_errors(caplog):
+    """5. 401, 403, 429 and 500: they still raise, no fallback happens, and NO fallback warning is logged."""
+    subgoal = Subgoal(description="Add feature", scope=["feat.py"], expects_tests=True)
+    diff = "diff --git a/feat.py b/feat.py\n+x = 1\n"
+
+    with caplog.at_level(logging.WARNING):
+        for code in (401, 403, 429):
+            fresh_gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+            resp_err = httpx.Response(code, text=f"Error {code}")
+            with patch.object(fresh_gk.client, "post", return_value=resp_err) as mock_post:
+                with pytest.raises(httpx.HTTPStatusError):
+                    fresh_gk.validate_subgoal(subgoal, diff)
+                assert mock_post.call_count == 1
+
+        fresh_gk_500 = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key", max_retries=1)
+        resp_500 = httpx.Response(500, text="Server Error 500")
+        with patch.object(fresh_gk_500.client, "post", return_value=resp_500) as mock_post:
+            with pytest.raises(httpx.HTTPStatusError):
+                fresh_gk_500.validate_subgoal(subgoal, diff)
+            assert mock_post.call_count == 1
+
+        # No fallback warnings were logged during 401, 403, 429, 500
+        fallback_warnings = [r for r in caplog.records if "valid-only" in r.message]
+        assert len(fallback_warnings) == 0
+
+        # Contrast: 400 triggers fallback and logs exactly one warning
+        resp_400 = httpx.Response(400, text="Bad request")
+        resp_200 = httpx.Response(200, json={"answers": {"valid": {"noul": 0.85}}})
+        gk_400 = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key="test_key")
+        with patch.object(gk_400.client, "post", side_effect=[resp_400, resp_200]):
+            gk_400.validate_subgoal(subgoal, diff)
+
+        fallback_warnings_after = [r for r in caplog.records if "valid-only" in r.message]
+        assert len(fallback_warnings_after) == 1
+
+
+def test_gatekeeper_fallback_warning_no_sensitive_data(caplog):
+    """6. The log output does not contain the API key or the diff text."""
+    secret_key = "super_secret_jev_key_12345"
+    secret_diff = "diff --git a/secret.py b/secret.py\n+def super_secret_algorithm(): return 42\n"
+    gk = Gatekeeper(api_url="https://api.typesafe.ai/v1/systemone", api_key=secret_key)
+    subgoal = Subgoal(description="Add feature", scope=["secret.py"], expects_tests=True)
+
+    resp_400 = httpx.Response(400, text="Error payload")
+    resp_200 = httpx.Response(200, json={"answers": {"valid": {"noul": 0.85}}})
+
+    with caplog.at_level(logging.WARNING):
+        with patch.object(gk.client, "post", side_effect=[resp_400, resp_200]):
+            gk.validate_subgoal(subgoal, secret_diff)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    log_text = caplog.text
+    assert secret_key not in log_text
+    assert secret_diff not in log_text
+    assert "super_secret" not in log_text
+
 
 
 

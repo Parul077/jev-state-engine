@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -8,6 +9,8 @@ import httpx
 from dotenv import dotenv_values
 
 from jev.models import Subgoal, ValidationVerdict
+
+logger = logging.getLogger(__name__)
 
 
 class Gatekeeper:
@@ -180,6 +183,12 @@ class Gatekeeper:
         except httpx.HTTPStatusError as e:
             if e.response.status_code in (400, 422):
                 self._valid_only_mode = True
+                status_code = e.response.status_code
+                body_truncated = (e.response.text or "")[:500]
+                logger.warning(
+                    f"Jev API returned HTTP {status_code}: {body_truncated}. "
+                    "Retry intelligence is degraded and Gatekeeper is now valid-only for this instance."
+                )
                 fallback_payload = {
                     "model": "jev-latest",
                     "state": state,
