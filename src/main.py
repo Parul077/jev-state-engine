@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from dotenv import dotenv_values
 
+from jev.dependency_delta import format_dependency_summary
 from jev.engine import JevEngine
 from jev.evidence import format_evidence_summary
 from jev.gatekeeper import Gatekeeper
@@ -143,6 +144,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if hasattr(recorder, "get_run_evidence_level"):
         ev_level = recorder.get_run_evidence_level(args.thread_id)
     print(format_evidence_summary(ev_level, test_policy=args.test_policy))
+
+    dep_delta_json = None
+    if hasattr(recorder, "get_run_dependency_delta"):
+        dep_delta_json = recorder.get_run_dependency_delta(args.thread_id)
+    print(format_dependency_summary(dep_delta_json))
 
     if status == "escalated":
         print(f"[ESCALATION] Engine halted. Triggering status: {gate_status}")

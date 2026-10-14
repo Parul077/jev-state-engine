@@ -10,7 +10,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 from pydantic import BaseModel, Field
 
@@ -848,7 +848,65 @@ class Workspace:
                 return res.stdout
         return self.get_staged_diff()
 
+    def get_manifest_changes(
+        self, old_ref: str, new_ref: Optional[str] = None
+    ) -> Dict[str, Tuple[Optional[str], Optional[str]]]:
+        """Returns a dict of repo-relative posix paths to (old_text, new_text) for dependency manifests changed between old_ref and new_ref."""
+        from jev.dependency_delta import is_dependency_manifest_path
+
+        args = ["diff", "--name-status", "--no-renames", old_ref]
+        if new_ref is not None:
+            args.append(new_ref)
+
+        res = self._run_git(args)
+        changed_paths: Set[str] = set()
+
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                parts = line.strip().split("\t", 1)
+                if len(parts) == 2:
+                    p = parts[1].strip()
+                    posix_p = Path(p).as_posix()
+                    if is_dependency_manifest_path(posix_p):
+                        changed_paths.add(posix_p)
+
+        if new_ref is None:
+            status_res = self._run_git(["status", "--porcelain", "-uall"])
+            if status_res.returncode == 0 and status_res.stdout:
+                for line in status_res.stdout.splitlines():
+                    if len(line) > 3:
+                        p = line[3:].strip()
+                        if p.startswith('"') and p.endswith('"'):
+                            p = p[1:-1]
+                        posix_p = Path(p).as_posix()
+                        if is_dependency_manifest_path(posix_p):
+                            changed_paths.add(posix_p)
+
+        changes: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+        for posix_p in sorted(changed_paths):
+            show_old = self._run_git(["show", f"{old_ref}:{posix_p}"])
+            old_text = show_old.stdout if show_old.returncode == 0 else None
+
+            if new_ref is not None:
+                show_new = self._run_git(["show", f"{new_ref}:{posix_p}"])
+                new_text = show_new.stdout if show_new.returncode == 0 else None
+            else:
+                target_file = self.worktree_dir / posix_p
+                if target_file.is_file():
+                    try:
+                        new_text = target_file.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        new_text = None
+                else:
+                    new_text = None
+
+            if old_text is not None or new_text is not None:
+                changes[posix_p] = (old_text, new_text)
+
+        return changes
+
     def commit_subgoal(self, message: str = "Subgoal committed") -> None:
+
         self._run_git(["add", "-A"])
         self._run_git(["commit", "-m", message])
 

@@ -30,8 +30,10 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from jev.dependency_delta import compute_dependency_delta
 from jev.evidence import evidence_level
 from jev.ledger import NullRecorder, Recorder
+
 from jev.models import (
     CompileOutcome,
     MechanicalCheckResult,
@@ -101,6 +103,13 @@ class SafeRecorder(NullRecorder):
     def has_run(self, *args: Any, **kwargs: Any) -> bool:
         res = self._call("has_run", *args, **kwargs)
         return bool(res)
+
+    def get_run_evidence_level(self, *args: Any, **kwargs: Any) -> Optional[str]:
+        return self._call("get_run_evidence_level", *args, **kwargs)
+
+    def get_run_dependency_delta(self, *args: Any, **kwargs: Any) -> Optional[str]:
+        return self._call("get_run_dependency_delta", *args, **kwargs)
+
 
 
 def _get_engine_commit() -> Optional[str]:
@@ -2117,6 +2126,7 @@ def _snapshot_attempt(
     verdict: Optional[Any] = None,
     feedback_sent: Optional[str] = None,
     evidence_level: Optional[str] = None,
+    dependency_delta: Optional[str] = None,
 ) -> None:
     """Helper to snapshot an attempt row to the ledger."""
     if not recorder:
@@ -2177,7 +2187,9 @@ def _snapshot_attempt(
         tokens_in=state.get("worker_tokens_in") if subgoal_id != "__verify__" else None,
         tokens_out=state.get("worker_tokens_out") if subgoal_id != "__verify__" else None,
         evidence_level=evidence_level,
+        dependency_delta=dependency_delta,
     )
+
 
 
 def node_gate(
@@ -2512,7 +2524,18 @@ def node_gate(
         test_policy=state.get("test_policy"),
     )
 
+    attempt_dep_delta = None
+    if workspace is not None and hasattr(workspace, "get_manifest_changes"):
+        try:
+            changes = workspace.get_manifest_changes("HEAD")
+            delta = compute_dependency_delta(changes)
+            attempt_dep_delta = delta.to_json()
+        except Exception as e:
+            logger.warning(f"{type(e).__name__}: {e}")
+            attempt_dep_delta = None
+
     inv_notes = state.get("investigation_notes")
+
     if _accepts_param(gatekeeper.validate_subgoal, "investigation_notes"):
         verdict = gatekeeper.validate_subgoal(
             subgoal, diff, mechanical_detail=mech_result.detail, investigation_notes=inv_notes
@@ -2550,7 +2573,8 @@ def node_gate(
                 state["last_feedback"] = err_msg
                 _snapshot_attempt(
                     safe_rec, state, subgoal_id, tier="merge", outcome="merge_failed",
-                    diff=diff, feedback_sent=err_msg, evidence_level=ev_level
+                    diff=diff, feedback_sent=err_msg, evidence_level=ev_level,
+                    dependency_delta=attempt_dep_delta,
                 )
                 _teardown_worktree(state, workspace)
                 subgoal.status = "failed"
@@ -2592,7 +2616,8 @@ def node_gate(
                 state["last_feedback"] = f"Worktree merge failed: {e}"
                 _snapshot_attempt(
                     safe_rec, state, subgoal_id, tier="merge", outcome="merge_failed",
-                    diff=diff, feedback_sent=str(e), evidence_level=ev_level
+                    diff=diff, feedback_sent=str(e), evidence_level=ev_level,
+                    dependency_delta=attempt_dep_delta,
                 )
                 _teardown_worktree(state, workspace)
                 subgoal.status = "failed"
@@ -2617,7 +2642,8 @@ def node_gate(
             err_msg = "Worktree was created but worktree state was missing or invalid at gate time."
             _snapshot_attempt(
                 safe_rec, state, subgoal_id, tier="worktree", outcome="worktree_state_missing",
-                diff=diff, feedback_sent=err_msg, evidence_level=ev_level
+                diff=diff, feedback_sent=err_msg, evidence_level=ev_level,
+                dependency_delta=attempt_dep_delta,
             )
             _teardown_worktree(state, workspace)
             subgoal.status = "failed"
@@ -2673,6 +2699,7 @@ def node_gate(
             test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
             feedback_sent="",
             evidence_level=ev_level,
+            dependency_delta=attempt_dep_delta,
         )
         if safe_rec:
             safe_rec.record_subgoal_committed(run_id, subgoal_id, parent_sha=parent_sha, commit_sha=commit_sha)
@@ -2734,6 +2761,7 @@ def node_gate(
             test_outcome=test_runner_telemetry.get("outcome") if isinstance(test_runner_telemetry, dict) else None,
             feedback_sent=state.get("last_feedback"),
             evidence_level=ev_level,
+            dependency_delta=attempt_dep_delta,
         )
         _teardown_worktree(state, workspace)
 
@@ -3459,11 +3487,23 @@ class JevEngine:
         inv_notes = final_state.get("investigation_notes") or ""
         notes_chars = len(inv_notes)
 
+        run_dep_delta = None
+        if final_status == "completed" and final_commit and base_commit and final_commit != base_commit:
+            if self.workspace is not None and hasattr(self.workspace, "get_manifest_changes"):
+                try:
+                    changes = self.workspace.get_manifest_changes(base_commit, final_commit)
+                    delta = compute_dependency_delta(changes)
+                    run_dep_delta = delta.to_json()
+                except Exception as e:
+                    logger.warning(f"{type(e).__name__}: {e}")
+                    run_dep_delta = None
+
         self.recorder.record_run_end(
             run_id=run_id,
             final_status=final_status,
             final_commit=final_commit,
             notes_chars=notes_chars,
+            dependency_delta=run_dep_delta,
         )
 
         return final_state

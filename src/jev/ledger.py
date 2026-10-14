@@ -68,6 +68,7 @@ class Recorder(Protocol):
         ended_at: Optional[str] = None,
         notes_chars: Optional[int] = None,
         evidence_level: Optional[str] = None,
+        dependency_delta: Optional[str] = None,
     ) -> None: ...
 
     def record_subgoals(
@@ -115,11 +116,15 @@ class Recorder(Protocol):
         tokens_out: Optional[int] = None,
         created_at: Optional[str] = None,
         evidence_level: Optional[str] = None,
+        dependency_delta: Optional[str] = None,
     ) -> None: ...
 
     def has_run(self, run_id: str) -> bool: ...
 
     def get_run_evidence_level(self, run_id: str) -> Optional[str]: ...
+
+    def get_run_dependency_delta(self, run_id: str) -> Optional[str]: ...
+
 
 
 class NullRecorder:
@@ -150,6 +155,7 @@ class NullRecorder:
         ended_at: Optional[str] = None,
         notes_chars: Optional[int] = None,
         evidence_level: Optional[str] = None,
+        dependency_delta: Optional[str] = None,
     ) -> None:
         pass
 
@@ -201,6 +207,7 @@ class NullRecorder:
         tokens_out: Optional[int] = None,
         created_at: Optional[str] = None,
         evidence_level: Optional[str] = None,
+        dependency_delta: Optional[str] = None,
     ) -> None:
         pass
 
@@ -208,6 +215,9 @@ class NullRecorder:
         return False
 
     def get_run_evidence_level(self, run_id: str) -> Optional[str]:
+        return None
+
+    def get_run_dependency_delta(self, run_id: str) -> Optional[str]:
         return None
 
 
@@ -256,7 +266,8 @@ class SqliteLedger:
                   status TEXT,
                   started_at TEXT,
                   ended_at TEXT,
-                  notes_chars INTEGER
+                  notes_chars INTEGER,
+                  dependency_delta TEXT
                 );
                 """
             )
@@ -272,6 +283,8 @@ class SqliteLedger:
                 conn.execute("ALTER TABLE runs ADD COLUMN repo_profile TEXT DEFAULT NULL")
             if "profile_chars" not in cols:
                 conn.execute("ALTER TABLE runs ADD COLUMN profile_chars INTEGER DEFAULT NULL")
+            if "dependency_delta" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN dependency_delta TEXT DEFAULT NULL")
 
             conn.execute(
                 """
@@ -315,6 +328,7 @@ class SqliteLedger:
                   tokens_out INTEGER,
                   created_at TEXT,
                   evidence_level TEXT,
+                  dependency_delta TEXT,
                   PRIMARY KEY (run_id, subgoal_id, attempt_no)
                 );
                 """
@@ -322,6 +336,9 @@ class SqliteLedger:
             att_cols = [r[1] for r in conn.execute("PRAGMA table_info(attempts)").fetchall()]
             if "evidence_level" not in att_cols:
                 conn.execute("ALTER TABLE attempts ADD COLUMN evidence_level TEXT DEFAULT NULL")
+            if "dependency_delta" not in att_cols:
+                conn.execute("ALTER TABLE attempts ADD COLUMN dependency_delta TEXT DEFAULT NULL")
+
 
     def has_run(self, run_id: str) -> bool:
         with self._get_connection() as conn:
@@ -387,6 +404,7 @@ class SqliteLedger:
         ended_at: Optional[str] = None,
         notes_chars: Optional[int] = None,
         evidence_level: Optional[str] = None,
+        dependency_delta: Optional[str] = None,
     ) -> None:
         end_time = ended_at or datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
@@ -417,11 +435,13 @@ class SqliteLedger:
                   final_commit = ?,
                   ended_at = ?,
                   notes_chars = ?,
-                  evidence_level = ?
+                  evidence_level = ?,
+                  dependency_delta = ?
                 WHERE run_id = ?
                 """,
-                (final_status, final_commit, end_time, notes_chars, evidence_level, run_id),
+                (final_status, final_commit, end_time, notes_chars, evidence_level, dependency_delta, run_id),
             )
+
 
     def record_subgoals(
         self,
@@ -516,6 +536,7 @@ class SqliteLedger:
         tokens_out: Optional[int] = None,
         created_at: Optional[str] = None,
         evidence_level: Optional[str] = None,
+        dependency_delta: Optional[str] = None,
     ) -> None:
         now_ts = created_at or datetime.now(timezone.utc).isoformat()
         if not diff_sha:
@@ -546,8 +567,8 @@ class SqliteLedger:
                   jev_valid, jev_probability, jev_model, jev_raw,
                   jev_tokens_in, jev_tokens_out,
                   feedback_sent, tokens_in, tokens_out, created_at,
-                  evidence_level
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  evidence_level, dependency_delta
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -573,6 +594,7 @@ class SqliteLedger:
                     tokens_out,
                     now_ts,
                     evidence_level,
+                    dependency_delta,
                 ),
             )
 
@@ -580,3 +602,9 @@ class SqliteLedger:
         with self._get_connection() as conn:
             row = conn.execute("SELECT evidence_level FROM runs WHERE run_id = ?", (run_id,)).fetchone()
             return row[0] if row else None
+
+    def get_run_dependency_delta(self, run_id: str) -> Optional[str]:
+        with self._get_connection() as conn:
+            row = conn.execute("SELECT dependency_delta FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            return row[0] if row else None
+

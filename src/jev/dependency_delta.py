@@ -76,6 +76,14 @@ class DependencyDelta(BaseModel):
             lines.append(f"unparsed: {', '.join(self.unparsed)}")
         return "\n".join(lines)
 
+    def to_json(self) -> str:
+        return self.model_dump_json()
+
+    @classmethod
+    def from_json(cls, json_str: str) -> DependencyDelta:
+        return cls.model_validate_json(json_str)
+
+
 
 PEP508_REGEX = re.compile(
     r"^([a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)(?:\[[^\]]*\])?\s*(.*)$"
@@ -519,3 +527,28 @@ def compute_dependency_delta(
         changed=sorted(changed),
         unparsed=sorted(list(set(unparsed))),
     )
+
+
+def is_dependency_manifest_path(path: str) -> bool:
+    basename = re.split(r"[\\/]", path)[-1]
+    if basename in LOCKFILES:
+        return False
+    if _is_unsupported_manifest(basename):
+        return True
+    if _get_manifest_parser_and_ecosystem(basename) is not None:
+        return True
+    return False
+
+
+def format_dependency_summary(delta_json: Optional[str]) -> str:
+    if delta_json is None:
+        return "Dependencies: not computed"
+    try:
+        delta = DependencyDelta.from_json(delta_json)
+    except Exception:
+        return "Dependencies: not computed"
+    if delta.is_empty and not delta.unparsed:
+        return "Dependencies: no changes"
+    summary_text = delta.to_summary_text()
+    return f"Dependencies: {summary_text}"
+
