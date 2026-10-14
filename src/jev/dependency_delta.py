@@ -85,7 +85,34 @@ GRADLE_DEP_REGEX = re.compile(
     r"\b([a-zA-Z][a-zA-Z0-9_]*)\s*(?:\(\s*)?['\"]([^'\"\s:]+):([^'\"\s:]+):([^'\"\s:]+)['\"]\s*\)?"
 )
 
-KNOWN_UNSUPPORTED_MANIFESTS = {"setup.py", "setup.cfg", "Pipfile"}
+KNOWN_UNSUPPORTED_BASENAMES = {
+    "setup.py",
+    "setup.cfg",
+    "Pipfile",
+    "Gemfile",
+    "composer.json",
+    "build.sbt",
+    "pubspec.yaml",
+    "mix.exs",
+    "Package.swift",
+    "Podfile",
+    "go.work",
+    "libs.versions.toml",
+    "deno.json",
+    "deno.jsonc",
+    "environment.yml",
+    "environment.yaml",
+    "Directory.Packages.props",
+    "packages.config",
+}
+
+KNOWN_UNSUPPORTED_SUFFIXES = (
+    ".csproj",
+    ".fsproj",
+    ".vbproj",
+    ".gemspec",
+    ".podspec",
+)
 
 LOCKFILES = {
     "package-lock.json",
@@ -98,11 +125,25 @@ LOCKFILES = {
     "Cargo.lock",
     "go.sum",
     "Pipfile.lock",
+    "Gemfile.lock",
+    "composer.lock",
+    "Podfile.lock",
 }
 
 
+def _is_unsupported_manifest(basename: str) -> bool:
+    if basename in KNOWN_UNSUPPORTED_BASENAMES:
+        return True
+    if basename.lower() in {b.lower() for b in KNOWN_UNSUPPORTED_BASENAMES}:
+        return True
+    for suffix in KNOWN_UNSUPPORTED_SUFFIXES:
+        if basename.lower().endswith(suffix.lower()):
+            return True
+    return False
+
+
 def _normalize_python_name(name: str) -> str:
-    return name.lower().replace("_", "-")
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def _parse_pep508_dep(entry: str) -> Tuple[str, Optional[str]]:
@@ -201,14 +242,37 @@ def _parse_pyproject_toml(text: str) -> Dict[Tuple[str, str], Optional[str]]:
     return deps
 
 
+def _join_line_continuations(text: str) -> List[str]:
+    lines = text.splitlines()
+    joined_lines: List[str] = []
+    current_line = ""
+    for line in lines:
+        stripped = line.strip()
+        if current_line:
+            current_line += " " + stripped
+        else:
+            current_line = stripped
+        if current_line.endswith("\\"):
+            current_line = current_line[:-1].rstrip()
+        else:
+            joined_lines.append(current_line)
+            current_line = ""
+    if current_line:
+        joined_lines.append(current_line)
+    return joined_lines
+
+
 def _parse_requirements_txt(text: str) -> Dict[Tuple[str, str], Optional[str]]:
     deps: Dict[Tuple[str, str], Optional[str]] = {}
-    for line in text.splitlines():
-        line = line.strip()
+    for line in _join_line_continuations(text):
         if not line or line.startswith("#"):
             continue
         clean = line.split("#", 1)[0].strip()
         if not clean or clean.startswith("-") or "://" in clean:
+            continue
+        clean = clean.split(";", 1)[0].strip()
+        clean = re.split(r"\s+--?[a-zA-Z0-9_-]+", clean)[0].strip()
+        if not clean:
             continue
         name, ver = _parse_pep508_dep(clean)
         if name:
@@ -293,8 +357,18 @@ def _local_tag(elem: ET.Element) -> str:
 def _parse_pom_xml(text: str) -> Dict[Tuple[str, str], Optional[str]]:
     root = ET.fromstring(text)
     deps: Dict[Tuple[str, str], Optional[str]] = {}
-    for elem in root.iter():
-        if _local_tag(elem) == "dependency":
+
+    def _traverse(elem: ET.Element, ancestors: List[str]):
+        local = _local_tag(elem)
+        current_ancestors = ancestors + [local]
+        if local == "dependency":
+            if "plugin" in ancestors:
+                section = "plugin-dependencies"
+            elif "dependencyManagement" in ancestors:
+                section = "dependencyManagement"
+            else:
+                section = "dependencies"
+
             group_id = None
             artifact_id = None
             version = None
@@ -308,7 +382,13 @@ def _parse_pom_xml(text: str) -> Dict[Tuple[str, str], Optional[str]]:
                     version = child.text.strip() if child.text else None
             if group_id and artifact_id:
                 name = f"{group_id}:{artifact_id}"
-                deps[("dependencies", name)] = version
+                deps[(section, name)] = version
+            return
+
+        for child in elem:
+            _traverse(child, current_ancestors)
+
+    _traverse(root, [])
     return deps
 
 
@@ -361,7 +441,7 @@ def compute_dependency_delta(
         basename = re.split(r"[\\/]", path)[-1]
         if basename in LOCKFILES:
             continue
-        if basename in KNOWN_UNSUPPORTED_MANIFESTS:
+        if _is_unsupported_manifest(basename):
             unparsed.append(path)
             continue
 
