@@ -149,6 +149,40 @@ class EcosystemProfile(BaseModel):
     frameworks: List[str] = Field(default_factory=list)
 
 
+def _is_absolute_path_str(s: str) -> bool:
+    if not s:
+        return False
+    if bool(re.match(r"^[a-zA-Z]:[\\/]", s)):
+        return True
+    if s.startswith("/") or s.startswith("\\\\"):
+        return True
+    return False
+
+
+def _clean_executable_name(s: str) -> str:
+    name = re.split(r"[\\/]", s)[-1]
+    for ext in (".cmd", ".exe", ".bat"):
+        if name.lower().endswith(ext):
+            name = name[:-len(ext)]
+            break
+    return name
+
+
+def _format_display_command(cmd: Optional[List[str]]) -> str:
+    if not cmd:
+        return "none"
+    display_cmd = list(cmd)
+    first = display_cmd[0]
+    if (
+        first == sys.executable
+        or os.path.normcase(first) == os.path.normcase(sys.executable)
+    ):
+        display_cmd[0] = "python"
+    elif _is_absolute_path_str(first):
+        display_cmd[0] = _clean_executable_name(first)
+    return " ".join(display_cmd)
+
+
 class RepositoryProfile(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -174,7 +208,7 @@ class RepositoryProfile(BaseModel):
                 continue
 
             if eco.compile_command:
-                compile_part = " ".join(eco.compile_command)
+                compile_part = _format_display_command(eco.compile_command)
             elif eco.compile_status == "syntax_check_only":
                 compile_part = "syntax_check_only"
             elif eco.compile_status == "env_not_ready":
@@ -183,13 +217,7 @@ class RepositoryProfile(BaseModel):
                 compile_part = "none"
 
             if eco.test_command:
-                test_cmd = list(eco.test_command)
-                if test_cmd and (
-                    test_cmd[0] == sys.executable
-                    or os.path.normcase(test_cmd[0]) == os.path.normcase(sys.executable)
-                ):
-                    test_cmd[0] = "python"
-                test_part = " ".join(test_cmd)
+                test_part = _format_display_command(eco.test_command)
             else:
                 test_part = "none"
 

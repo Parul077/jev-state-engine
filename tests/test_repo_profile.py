@@ -487,3 +487,166 @@ def test_nextjs_typescript_to_prompt_text(tmp_path, capsys):
     assert "compile: npm run typecheck" in prompt_text
     assert "tests: npm test" in prompt_text
     assert "frameworks: next, react, tailwindcss, typescript, vitest" in prompt_text
+
+
+def test_to_prompt_text_display_paths_windows_tsc():
+    """Windows tsc.cmd absolute path displays as clean 'tsc --noEmit'."""
+    eco = EcosystemProfile(
+        ecosystem="js_ts",
+        root=".",
+        manifest="package.json",
+        package_manager="npm",
+        compile_command=[r"C:\Users\DavyJ\Desktop\jp-bat\node_modules\.bin\tsc.cmd", "--noEmit"],
+        compile_status="command",
+    )
+    prof = RepositoryProfile(ecosystems=[eco], manifest_hash="abc")
+    prompt_text = prof.to_prompt_text()
+    assert "compile: tsc --noEmit" in prompt_text
+    assert "C:\\" not in prompt_text
+    assert "node_modules" not in prompt_text
+
+
+def test_to_prompt_text_display_paths_posix_tsc():
+    """POSIX node_modules/.bin/tsc absolute path displays as clean 'tsc --noEmit'."""
+    eco = EcosystemProfile(
+        ecosystem="js_ts",
+        root=".",
+        manifest="package.json",
+        package_manager="npm",
+        compile_command=["/home/user/project/node_modules/.bin/tsc", "--noEmit"],
+        compile_status="command",
+    )
+    prof = RepositoryProfile(ecosystems=[eco], manifest_hash="abc")
+    prompt_text = prof.to_prompt_text()
+    assert "compile: tsc --noEmit" in prompt_text
+    assert "/home" not in prompt_text
+    assert "node_modules" not in prompt_text
+
+
+def test_to_prompt_text_display_paths_windows_python():
+    """Windows python.exe path displays as clean 'python -m pytest -q'."""
+    eco = EcosystemProfile(
+        ecosystem="python",
+        root=".",
+        manifest="pyproject.toml",
+        package_manager="pip",
+        compile_status="syntax_check_only",
+        test_command=[r"C:\Python311\python.exe", "-m", "pytest", "-q"],
+        test_source="pytest",
+    )
+    prof = RepositoryProfile(ecosystems=[eco], manifest_hash="abc")
+    prompt_text = prof.to_prompt_text()
+    assert "tests: python -m pytest -q" in prompt_text
+    assert r"C:\Python311" not in prompt_text
+
+
+def test_to_prompt_text_display_paths_posix_python():
+    """POSIX /usr/bin/python path displays as clean 'python -m pytest -q'."""
+    eco = EcosystemProfile(
+        ecosystem="python",
+        root=".",
+        manifest="pyproject.toml",
+        package_manager="pip",
+        compile_status="syntax_check_only",
+        test_command=["/usr/bin/python", "-m", "pytest", "-q"],
+        test_source="pytest",
+    )
+    prof = RepositoryProfile(ecosystems=[eco], manifest_hash="abc")
+    prompt_text = prof.to_prompt_text()
+    assert "tests: python -m pytest -q" in prompt_text
+    assert "/usr/bin" not in prompt_text
+
+
+def test_to_prompt_text_display_paths_windows_mvnw():
+    """Windows mvnw.cmd path displays as clean 'mvnw'."""
+    eco = EcosystemProfile(
+        ecosystem="maven",
+        root=".",
+        manifest="pom.xml",
+        package_manager="mvn",
+        compile_command=[r"C:\Users\DavyJ\project\mvnw.cmd"],
+        compile_status="command",
+    )
+    prof = RepositoryProfile(ecosystems=[eco], manifest_hash="abc")
+    prompt_text = prof.to_prompt_text()
+    assert "compile: mvnw" in prompt_text
+    assert "C:\\" not in prompt_text
+
+
+def test_to_prompt_text_relative_command_unchanged():
+    """Relative commands like 'npm run build' are left completely unchanged."""
+    eco = EcosystemProfile(
+        ecosystem="js_ts",
+        root=".",
+        manifest="package.json",
+        package_manager="npm",
+        compile_command=["npm", "run", "build"],
+        compile_status="command",
+        test_command=["npm", "test"],
+        test_source="npm",
+    )
+    prof = RepositoryProfile(ecosystems=[eco], manifest_hash="abc")
+    prompt_text = prof.to_prompt_text()
+    assert "compile: npm run build" in prompt_text
+    assert "tests: npm test" in prompt_text
+
+
+def test_to_prompt_text_no_absolute_paths_in_existing_fixtures(tmp_path):
+    """Asserts that no absolute path appears in to_prompt_text() for any ecosystem fixture."""
+    import re
+
+    fixtures_prompts = []
+
+    # 1. JS fixture without typecheck script but with tsconfig & node_modules/.bin/tsc
+    repo_js_ts = tmp_path / "repo_js_ts_bin"
+    repo_js_ts.mkdir()
+    (repo_js_ts / "package.json").write_text('{"name": "test-bin"}')
+    (repo_js_ts / "tsconfig.json").write_text('{}')
+    bin_dir = repo_js_ts / "node_modules" / ".bin"
+    bin_dir.mkdir(parents=True)
+    tsc_name = "tsc.cmd" if os.name == "nt" else "tsc"
+    (bin_dir / tsc_name).write_text("")
+    prof_js_ts = build_repo_profile(repo_js_ts)
+    fixtures_prompts.append(prof_js_ts.to_prompt_text())
+
+    # 2. Python pytest fixture
+    repo_py = tmp_path / "repo_py_pytest"
+    repo_py.mkdir()
+    (repo_py / "pyproject.toml").write_text('[project]\nname="py-pkg"\n')
+    (repo_py / "pytest.ini").write_text("[pytest]\n")
+    prof_py = build_repo_profile(repo_py)
+    fixtures_prompts.append(prof_py.to_prompt_text())
+
+    # 3. Rust fixture
+    repo_rust = tmp_path / "repo_rust_test"
+    repo_rust.mkdir()
+    (repo_rust / "Cargo.toml").write_text('[package]\nname="r"\n')
+    prof_rust = build_repo_profile(repo_rust)
+    fixtures_prompts.append(prof_rust.to_prompt_text())
+
+    # 4. Go fixture
+    repo_go = tmp_path / "repo_go_test"
+    repo_go.mkdir()
+    (repo_go / "go.mod").write_text('module example.com/m\n\ngo 1.20\n')
+    prof_go = build_repo_profile(repo_go)
+    fixtures_prompts.append(prof_go.to_prompt_text())
+
+    # 5. Maven fixture
+    repo_mvn = tmp_path / "repo_mvn_test"
+    repo_mvn.mkdir()
+    (repo_mvn / "pom.xml").write_text('<project></project>')
+    prof_mvn = build_repo_profile(repo_mvn)
+    fixtures_prompts.append(prof_mvn.to_prompt_text())
+
+    # 6. Gradle fixture
+    repo_gradle = tmp_path / "repo_gradle_test"
+    repo_gradle.mkdir()
+    (repo_gradle / "build.gradle").write_text('')
+    prof_gradle = build_repo_profile(repo_gradle)
+    fixtures_prompts.append(prof_gradle.to_prompt_text())
+
+    for prompt_text in fixtures_prompts:
+        assert not re.search(r"[A-Za-z]:\\", prompt_text), f"Drive-letter path found: {prompt_text}"
+        assert not re.search(r"(?:^|\s)/[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)+", prompt_text), (
+            f"Leading '/' absolute path found: {prompt_text}"
+        )
