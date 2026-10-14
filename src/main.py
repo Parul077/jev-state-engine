@@ -140,14 +140,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     status = final_state.get("status")
     gate_status = final_state.get("gate_status")
 
+    target_run_id = final_state.get("run_id") or args.thread_id
+
     ev_level = None
     if hasattr(recorder, "get_run_evidence_level"):
-        ev_level = recorder.get_run_evidence_level(args.thread_id)
+        ev_level = recorder.get_run_evidence_level(target_run_id)
     print(format_evidence_summary(ev_level, test_policy=args.test_policy))
 
     dep_delta_json = None
     if hasattr(recorder, "get_run_dependency_delta"):
-        dep_delta_json = recorder.get_run_dependency_delta(args.thread_id)
+        dep_delta_json = recorder.get_run_dependency_delta(target_run_id)
     print(format_dependency_summary(dep_delta_json))
 
     if status == "escalated":

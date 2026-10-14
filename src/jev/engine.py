@@ -111,7 +111,6 @@ class SafeRecorder(NullRecorder):
         return self._call("get_run_dependency_delta", *args, **kwargs)
 
 
-
 def _get_engine_commit() -> Optional[str]:
     try:
         res = subprocess.run(
@@ -2189,7 +2188,6 @@ def _snapshot_attempt(
         evidence_level=evidence_level,
         dependency_delta=dependency_delta,
     )
-
 
 
 def node_gate(

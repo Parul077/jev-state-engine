@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -512,3 +513,121 @@ def test_old_schema_migration_leaves_old_rows_null(tmp_path):
         att = conn.execute("SELECT dependency_delta FROM attempts WHERE run_id = 'old-run-1'").fetchone()
         assert att is not None
         assert att[0] is None
+
+
+def test_get_manifest_changes_bogus_ref_raises(test_repo):
+    ws = Workspace(repo_dir=test_repo)
+    with pytest.raises(RuntimeError):
+        ws.get_manifest_changes("nonexistent_ref_12345")
+
+
+def test_get_manifest_changes_git_show_failure_raises(test_repo):
+    ws = Workspace(repo_dir=test_repo)
+    pkg = test_repo / "package.json"
+    pkg.write_text('{\n  "dependencies": {\n    "lodash": "4.17.21",\n    "axios": "1.0.0"\n  }\n}\n', encoding="utf-8")
+
+    orig_run_git = ws._run_git
+
+    def mock_run_git(args, **kwargs):
+        if len(args) >= 2 and args[0] == "show":
+            return subprocess.CompletedProcess(args, returncode=128, stdout="", stderr="fatal: mock git show failure")
+        return orig_run_git(args, **kwargs)
+
+    with patch.object(ws, "_run_git", side_effect=mock_run_git):
+        with pytest.raises(RuntimeError):
+            ws.get_manifest_changes("HEAD")
+
+
+def test_engine_workspace_get_manifest_changes_raises_stores_null_and_logs_warning(test_repo, tmp_path, caplog):
+    ws = Workspace(repo_dir=test_repo)
+    db_file = tmp_path / "ledger_fail.db"
+    ledger = SqliteLedger(db_path=db_file)
+    gk = FakeGatekeeper()
+
+    new_pkg = '{\n  "dependencies": {\n    "lodash": "4.17.21",\n    "axios": "1.4.0"\n  }\n}\n'
+    responses = [
+        AIMessage(content="", tool_calls=[ToolCall(name="finish_investigation", args={"summary": "ready"}, id="c1")]),
+        json.dumps([{"description": "Add axios to package.json", "scope": ["package.json"], "expects_tests": False}]),
+        AIMessage(content="", tool_calls=[ToolCall(name="stage_file_mutation", args={"path": "package.json", "content": new_pkg}, id="c2")]),
+        AIMessage(content="", tool_calls=[ToolCall(name="submit_subgoal", args={}, id="c3")]),
+    ]
+    llm = ScriptedChatModel(responses)
+
+    def _broken_manifest_changes(*args, **kwargs):
+        raise RuntimeError("git failure in get_manifest_changes")
+
+    with patch.object(ws, "get_manifest_changes", side_effect=_broken_manifest_changes), \
+         caplog.at_level(logging.WARNING):
+        engine = JevEngine(
+            workspace=ws,
+            gatekeeper=gk,
+            llm=llm,
+            recorder=ledger,
+            db_path=db_file,
+        )
+        final_state = engine.execute(ticket="Add axios fail", thread_id="t-fail")
+        assert final_state["status"] == "completed"
+
+    crash_warnings = [rec for rec in caplog.records if "RuntimeError: git failure in get_manifest_changes" in rec.message]
+    # Exactly one warning per computation (1 in gate for attempt, 1 in execute for run)
+    assert len(crash_warnings) == 2
+
+    with sqlite3.connect(str(db_file)) as conn:
+        run_row = conn.execute("SELECT dependency_delta FROM runs WHERE run_id = 't-fail'").fetchone()
+        assert run_row is not None
+        assert run_row[0] is None
+
+        att_row = conn.execute("SELECT dependency_delta FROM attempts WHERE run_id = 't-fail' AND subgoal_id != '__verify__'").fetchone()
+        assert att_row is not None
+        assert att_row[0] is None
+
+    summary = format_dependency_summary(ledger.get_run_dependency_delta("t-fail"))
+    assert summary == "Dependencies: not computed"
+
+
+def test_main_reused_thread_id_uses_run_id(test_repo, tmp_path, capsys):
+    import main
+
+    db_file = tmp_path / "ledger_main_reused.db"
+    shared_ledger = SqliteLedger(db_path=db_file)
+    gk = FakeGatekeeper()
+
+    # Run 1 changes package.json
+    new_pkg = '{\n  "dependencies": {\n    "lodash": "4.17.21",\n    "axios": "1.4.0"\n  }\n}\n'
+    responses_run1 = [
+        AIMessage(content="", tool_calls=[ToolCall(name="finish_investigation", args={"summary": "ready"}, id="c1")]),
+        json.dumps([{"description": "Add axios to package.json", "scope": ["package.json"], "expects_tests": False}]),
+        AIMessage(content="", tool_calls=[ToolCall(name="stage_file_mutation", args={"path": "package.json", "content": new_pkg}, id="c2")]),
+        AIMessage(content="", tool_calls=[ToolCall(name="submit_subgoal", args={}, id="c3")]),
+    ]
+    # Run 2 only changes src/app.py (no manifest changes)
+    new_app = "def add(a, b):\n    return a + b + 42\n"
+    responses_run2 = [
+        AIMessage(content="", tool_calls=[ToolCall(name="finish_investigation", args={"summary": "ready"}, id="c4")]),
+        json.dumps([{"description": "Update app.py", "scope": ["src/app.py"], "expects_tests": False}]),
+        AIMessage(content="", tool_calls=[ToolCall(name="stage_file_mutation", args={"path": "src/app.py", "content": new_app}, id="c5")]),
+        AIMessage(content="", tool_calls=[ToolCall(name="submit_subgoal", args={}, id="c6")]),
+    ]
+
+    llm1 = ScriptedChatModel(responses_run1)
+    llm2 = ScriptedChatModel(responses_run2)
+
+    with patch("main.SqliteLedger", return_value=shared_ledger), \
+         patch("main.Gatekeeper", return_value=gk), \
+         patch.dict(os.environ, {"GOOGLE_API_KEY": "test-key"}):
+
+        # First run with thread-id "reused-tid"
+        with patch("langchain_google_genai.ChatGoogleGenerativeAI", return_value=llm1):
+            rc1 = main.main(["Add axios", "--repo-dir", str(test_repo), "--thread-id", "reused-tid", "--db-path", str(tmp_path / "cp1.db")])
+            assert rc1 == 0
+            captured1 = capsys.readouterr()
+            assert "axios" in captured1.out
+
+        # Second run with SAME thread-id "reused-tid"
+        with patch("langchain_google_genai.ChatGoogleGenerativeAI", return_value=llm2):
+            rc2 = main.main(["Update app", "--repo-dir", str(test_repo), "--thread-id", "reused-tid", "--db-path", str(tmp_path / "cp2.db")])
+            assert rc2 == 0
+            captured2 = capsys.readouterr()
+            assert "Dependencies: no changes" in captured2.out
+            assert "axios" not in captured2.out
+

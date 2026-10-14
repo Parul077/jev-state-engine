@@ -339,7 +339,6 @@ class SqliteLedger:
             if "dependency_delta" not in att_cols:
                 conn.execute("ALTER TABLE attempts ADD COLUMN dependency_delta TEXT DEFAULT NULL")
 
-
     def has_run(self, run_id: str) -> bool:
         with self._get_connection() as conn:
             row = conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone()
@@ -441,7 +440,6 @@ class SqliteLedger:
                 """,
                 (final_status, final_commit, end_time, notes_chars, evidence_level, dependency_delta, run_id),
             )
-
 
     def record_subgoals(
         self,

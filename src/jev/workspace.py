@@ -859,46 +859,75 @@ class Workspace:
             args.append(new_ref)
 
         res = self._run_git(args)
-        changed_paths: Set[str] = set()
+        if res.returncode != 0:
+            raise RuntimeError(f"git diff failed with exit code {res.returncode}: {res.stderr}")
 
-        if res.returncode == 0 and res.stdout:
+        diff_status: Dict[str, str] = {}
+        if res.stdout:
             for line in res.stdout.splitlines():
                 parts = line.strip().split("\t", 1)
                 if len(parts) == 2:
+                    status_code = parts[0].strip().upper()
                     p = parts[1].strip()
                     posix_p = Path(p).as_posix()
                     if is_dependency_manifest_path(posix_p):
-                        changed_paths.add(posix_p)
+                        diff_status[posix_p] = status_code[0] if status_code else ""
 
+        untracked_paths: Set[str] = set()
         if new_ref is None:
             status_res = self._run_git(["status", "--porcelain", "-uall"])
-            if status_res.returncode == 0 and status_res.stdout:
+            if status_res.returncode != 0:
+                raise RuntimeError(f"git status failed with exit code {status_res.returncode}: {status_res.stderr}")
+            if status_res.stdout:
                 for line in status_res.stdout.splitlines():
-                    if len(line) > 3:
+                    if len(line) > 3 and line[:2] == "??":
                         p = line[3:].strip()
                         if p.startswith('"') and p.endswith('"'):
                             p = p[1:-1]
                         posix_p = Path(p).as_posix()
                         if is_dependency_manifest_path(posix_p):
-                            changed_paths.add(posix_p)
+                            untracked_paths.add(posix_p)
 
+        all_paths = sorted(set(diff_status.keys()) | untracked_paths)
         changes: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-        for posix_p in sorted(changed_paths):
-            show_old = self._run_git(["show", f"{old_ref}:{posix_p}"])
-            old_text = show_old.stdout if show_old.returncode == 0 else None
 
-            if new_ref is not None:
-                show_new = self._run_git(["show", f"{new_ref}:{posix_p}"])
-                new_text = show_new.stdout if show_new.returncode == 0 else None
+        for posix_p in all_paths:
+            # Determine old_text
+            if posix_p in untracked_paths and posix_p not in diff_status:
+                old_text = None
             else:
-                target_file = self.worktree_dir / posix_p
-                if target_file.is_file():
-                    try:
-                        new_text = target_file.read_text(encoding="utf-8", errors="replace")
-                    except Exception:
-                        new_text = None
+                code = diff_status.get(posix_p, "")
+                if code == "A":
+                    old_text = None
                 else:
+                    show_old = self._run_git(["show", f"{old_ref}:{posix_p}"])
+                    if show_old.returncode != 0:
+                        raise RuntimeError(f"git show {old_ref}:{posix_p} failed with exit code {show_old.returncode}: {show_old.stderr}")
+                    old_text = show_old.stdout
+
+            # Determine new_text
+            if new_ref is not None:
+                code = diff_status.get(posix_p, "")
+                if code == "D":
                     new_text = None
+                else:
+                    show_new = self._run_git(["show", f"{new_ref}:{posix_p}"])
+                    if show_new.returncode != 0:
+                        raise RuntimeError(f"git show {new_ref}:{posix_p} failed with exit code {show_new.returncode}: {show_new.stderr}")
+                    new_text = show_new.stdout
+            else:
+                code = diff_status.get(posix_p, "")
+                if code == "D":
+                    new_text = None
+                else:
+                    target_file = self.worktree_dir / posix_p
+                    if target_file.is_file():
+                        try:
+                            new_text = target_file.read_text(encoding="utf-8", errors="replace")
+                        except Exception:
+                            new_text = None
+                    else:
+                        new_text = None
 
             if old_text is not None or new_text is not None:
                 changes[posix_p] = (old_text, new_text)
@@ -906,7 +935,6 @@ class Workspace:
         return changes
 
     def commit_subgoal(self, message: str = "Subgoal committed") -> None:
-
         self._run_git(["add", "-A"])
         self._run_git(["commit", "-m", message])
 
