@@ -43,7 +43,20 @@ from jev.models import (
     TestPolicy,
     ValidationVerdict,
 )
-from jev.workspace import MainDivergedError, TrackedModificationsError, Workspace
+from jev.workspace import (
+    MAX_READ_CHARS,
+    MainDivergedError,
+    TrackedModificationsError,
+    Workspace,
+)
+
+MAX_IMPLEMENT_FILE_CHARS = 80_000
+
+
+def _cap_read_text(text: str) -> str:
+    if len(text) > MAX_READ_CHARS:
+        return text[:MAX_READ_CHARS] + f"\n[truncated: showing first {MAX_READ_CHARS} of {len(text)} characters]"
+    return text
 
 logger = logging.getLogger(__name__)
 
@@ -791,7 +804,7 @@ def node_investigate(
             try:
                 output = workspace.run_read_tool("cat", [path])
                 if output is not None and "Command not found: cat" not in output:
-                    return output
+                    return _cap_read_text(output)
             except Exception:
                 pass
 
@@ -800,7 +813,7 @@ def node_investigate(
                 if target.is_dir():
                     return f"Error: {path} is a directory, not a file. Use list_dir instead."
                 try:
-                    return target.read_text(encoding="utf-8", errors="replace")
+                    return _cap_read_text(target.read_text(encoding="utf-8", errors="replace"))
                 except Exception as e:
                     return f"Error reading file {path}: {e}"
             return f"File not found: {path}"
@@ -1687,6 +1700,7 @@ def node_implement(
     state: State,
     workspace: Optional[Any] = None,
     llm: Optional[Any] = None,
+    gatekeeper: Optional[Any] = None,
 ) -> State:
     """State 3: IMPLEMENTATION (Executes subgoal mutations in isolated worktree)."""
     if "trajectory" not in state or state["trajectory"] is None:
@@ -1898,7 +1912,28 @@ def node_implement(
                 target_file = Path(worktree) / s_file
                 if target_file.exists() and target_file.is_file():
                     try:
-                        file_content = target_file.read_text(encoding="utf-8")
+                        file_content = target_file.read_text(encoding="utf-8", errors="replace")
+                        if len(file_content) > MAX_IMPLEMENT_FILE_CHARS:
+                            msg = (
+                                f"File '{s_file}' ({len(file_content)} characters) is too large for a safe full-file rewrite "
+                                f"(maximum allowed is {MAX_IMPLEMENT_FILE_CHARS} characters)."
+                            )
+                            state["status"] = "escalated"
+                            state["gate_status"] = "escalated"
+                            state["last_feedback"] = msg
+                            state["trajectory"].append({
+                                "node": "implement",
+                                "subgoal": getattr(subgoal, "description", ""),
+                                "error": msg,
+                            })
+                            _safe_escalate_deadlock(
+                                gatekeeper,
+                                trajectory=state.get("trajectory", []),
+                                triggering_tier="implementation",
+                                integration_branch=state.get("integration_branch"),
+                                thread_id=state.get("thread_id"),
+                            )
+                            return state
                         existing_files_context.append(f"--- Existing file: {s_file} ---\n{file_content}\n--- End of {s_file} ---")
                     except Exception:
                         pass
@@ -2212,6 +2247,9 @@ def node_gate(
         Do NOT touch mechanical_strike_count.
         If semantic_strike_count reaches 3, escalate_deadlock.
     """
+    if state.get("status") == "escalated":
+        return state
+
     if "trajectory" not in state or state["trajectory"] is None:
         state["trajectory"] = []
 
@@ -3294,7 +3332,7 @@ class JevEngine:
         return node_plan(state, workspace=self.workspace, llm=self.llm, gatekeeper=self.gatekeeper, recorder=self.recorder)
 
     def _node_implement(self, state: State) -> State:
-        return node_implement(state, workspace=self.workspace, llm=self.llm)
+        return node_implement(state, workspace=self.workspace, llm=self.llm, gatekeeper=self.gatekeeper)
 
     def node_gate(self, state: State) -> State:
         return node_gate(state, workspace=self.workspace, gatekeeper=self.gatekeeper, recorder=self.recorder)

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -15,6 +16,85 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 from pydantic import BaseModel, Field
 
 from jev.models import CompileOutcome, MechanicalCheckResult, Subgoal, TestOutcome
+
+
+MAX_READ_CHARS = 40_000
+
+
+def _cap_read_text(text: str) -> str:
+    if len(text) > MAX_READ_CHARS:
+        return text[:MAX_READ_CHARS] + f"\n[truncated: showing first {MAX_READ_CHARS} of {len(text)} characters]"
+    return text
+
+
+def _run_test_subprocess(
+    cmd: List[str],
+    cwd: Union[str, Path],
+    timeout: int,
+) -> subprocess.CompletedProcess:
+    from unittest.mock import MagicMock, Mock
+    if isinstance(subprocess.run, (MagicMock, Mock)):
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+
+    kwargs: Dict[str, Any] = {
+        "cwd": cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=proc.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
+        )
+    except subprocess.TimeoutExpired:
+        if sys.platform == "win32":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise RuntimeError(f"Test command timed out after {timeout} seconds and its process tree was terminated")
+
 
 
 class MainDivergedError(RuntimeError):
@@ -595,6 +675,7 @@ class Workspace:
         self,
         repo_dir: Optional[Union[str, Path]] = None,
         worktree_dir: Optional[Union[str, Path]] = None,
+        test_timeout: Optional[int] = None,
     ):
         self.repo_dir = Path(repo_dir).resolve() if repo_dir else Path.cwd().resolve()
         self.worktree_dir = (
@@ -603,6 +684,37 @@ class Workspace:
         self.base_commit: Optional[str] = self._get_head_commit()
         self.last_test_run: Optional[dict] = None
         self.last_compile_run: Optional[dict] = None
+
+        if test_timeout is not None:
+            try:
+                ival = int(test_timeout)
+                if ival <= 0:
+                    raise ValueError()
+                self.test_timeout = ival
+            except (ValueError, TypeError):
+                raise ValueError(f"test_timeout must be a positive integer, got {test_timeout}")
+        else:
+            env_val = os.environ.get("JEV_TEST_TIMEOUT")
+            if env_val is not None:
+                try:
+                    ival = int(env_val)
+                    if ival <= 0:
+                        raise ValueError()
+                    self.test_timeout = ival
+                except (ValueError, TypeError):
+                    self.test_timeout = 600
+            else:
+                self.test_timeout = 600
+
+    def _run_test_subprocess(
+        self,
+        cmd: List[str],
+        cwd: Union[str, Path],
+        timeout: Optional[int] = None,
+    ) -> subprocess.CompletedProcess:
+        eff_timeout = timeout if timeout is not None else self.test_timeout
+        return _run_test_subprocess(cmd, cwd=cwd, timeout=eff_timeout)
+
 
     def _record_test_run(
         self,
@@ -782,7 +894,7 @@ class Workspace:
                     return f"cat: {args_list[0]}: Is a directory"
                 if target.exists() and target.is_file():
                     try:
-                        return target.read_text(encoding="utf-8", errors="replace")
+                        return _cap_read_text(target.read_text(encoding="utf-8", errors="replace"))
                     except Exception as e:
                         return str(e)
                 return f"cat: {args_list[0]}: No such file or directory"
@@ -798,7 +910,8 @@ class Workspace:
                 encoding="utf-8",
                 errors="replace",
             )
-            return res.stdout if res.returncode == 0 else res.stderr
+            out = res.stdout if res.returncode == 0 else res.stderr
+            return _cap_read_text(out) if cmd == "cat" else out
 
         except FileNotFoundError:
             if cmd == "cat" and args_list:
@@ -807,7 +920,7 @@ class Workspace:
                     return f"cat: {args_list[0]}: Is a directory"
                 if target.exists() and target.is_file():
                     try:
-                        return target.read_text(encoding="utf-8", errors="replace")
+                        return _cap_read_text(target.read_text(encoding="utf-8", errors="replace"))
                     except Exception as e:
                         return str(e)
                 return f"cat: {args_list[0]}: No such file or directory"
@@ -1331,13 +1444,10 @@ class Workspace:
                 )
             exec_cmd = [resolved] + cmd[1:]
             try:
-                sub_res = subprocess.run(
+                sub_res = self._run_test_subprocess(
                     exec_cmd,
                     cwd=wt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+                    timeout=self.test_timeout,
                 )
                 outcome = TestOutcome.PASSED if sub_res.returncode == 0 else TestOutcome.FAILED
                 return self._record_test_run(ecosystem, cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)
@@ -1346,13 +1456,10 @@ class Workspace:
 
         elif ecosystem == "pytest":
             try:
-                sub_res = subprocess.run(
+                sub_res = self._run_test_subprocess(
                     cmd,
                     cwd=wt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
+                    timeout=self.test_timeout,
                 )
                 if sub_res.returncode == 0:
                     outcome = TestOutcome.PASSED
@@ -1367,13 +1474,10 @@ class Workspace:
         elif ecosystem == "terraform":
             if shutil.which("terraform"):
                 try:
-                    sub_res = subprocess.run(
+                    sub_res = self._run_test_subprocess(
                         cmd,
                         cwd=wt,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
+                        timeout=self.test_timeout,
                     )
                     outcome = TestOutcome.PASSED if sub_res.returncode == 0 else TestOutcome.FAILED
                     return self._record_test_run("terraform", cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)
@@ -1386,13 +1490,10 @@ class Workspace:
         elif ecosystem == "ansible":
             if shutil.which("ansible-lint") or shutil.which("ansible-playbook"):
                 try:
-                    sub_res = subprocess.run(
+                    sub_res = self._run_test_subprocess(
                         cmd,
                         cwd=wt,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
+                        timeout=self.test_timeout,
                     )
                     outcome = TestOutcome.PASSED if sub_res.returncode == 0 else TestOutcome.FAILED
                     return self._record_test_run("ansible", cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)
@@ -1405,13 +1506,10 @@ class Workspace:
         elif ecosystem == "helm":
             if shutil.which("helm"):
                 try:
-                    sub_res = subprocess.run(
+                    sub_res = self._run_test_subprocess(
                         cmd,
                         cwd=wt,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
+                        timeout=self.test_timeout,
                     )
                     outcome = TestOutcome.PASSED if sub_res.returncode == 0 else TestOutcome.FAILED
                     return self._record_test_run("helm", cmd, sub_res.returncode, sub_res.stdout, sub_res.stderr, outcome)

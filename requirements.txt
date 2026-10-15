@@ -3,3 +3,6 @@ pytest
 httpx
 python-dotenv
 langgraph
+langchain-core
+langchain-google-genai
+tomli; python_version < "3.11"

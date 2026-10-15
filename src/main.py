@@ -24,6 +24,16 @@ def generate_default_thread_id() -> str:
     return f"run-{ts}-{rnd}"
 
 
+def positive_int(value: str) -> int:
+    try:
+        val = int(value)
+        if val <= 0:
+            raise ValueError()
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError(f"'{value}' is not a positive integer")
+    return val
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Jev State Engine: Deterministic State Machine with Two-Tier Gating"
@@ -76,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="Inject repository profile into plan and implement prompts (on, off; defaults to off).",
     )
+    parser.add_argument(
+        "--test-timeout",
+        type=positive_int,
+        default=None,
+        help="Timeout in seconds for test suite execution (positive integer; defaults to JEV_TEST_TIMEOUT or 600).",
+    )
     return parser
 
 
@@ -86,8 +102,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     repo_dir = Path(args.repo_dir).resolve() if args.repo_dir else Path.cwd().resolve()
 
+    test_timeout = args.test_timeout
+    if test_timeout is None:
+        env_timeout = os.environ.get("JEV_TEST_TIMEOUT")
+        if env_timeout is not None:
+            try:
+                test_timeout = positive_int(env_timeout)
+            except argparse.ArgumentTypeError as e:
+                parser.error(str(e))
+        else:
+            test_timeout = 600
+
     # Wire Dependency Injection
-    workspace = Workspace(repo_dir=repo_dir)
+    workspace = Workspace(repo_dir=repo_dir, test_timeout=test_timeout)
     engine_env = Path.cwd() / ".env"
     if not engine_env.exists():
         engine_env = Path(__file__).resolve().parent.parent / ".env"
