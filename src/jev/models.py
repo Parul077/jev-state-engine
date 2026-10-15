@@ -1,6 +1,7 @@
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
 
 
 class TestOutcome(str, Enum):

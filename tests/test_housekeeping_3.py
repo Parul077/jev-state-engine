@@ -189,6 +189,43 @@ def test_test_timeout_invalid_values_rejected(clean_repo):
         Workspace(repo_dir=clean_repo, test_timeout=-5)
 
 
+def test_production_code_has_no_test_double_detection():
+    """src/jev/workspace.py must not import unittest.mock or check isinstance on subprocess.run."""
+    ws_file = Path(__file__).resolve().parent.parent / "src" / "jev" / "workspace.py"
+    content = ws_file.read_text(encoding="utf-8")
+    assert "unittest.mock" not in content
+    assert "isinstance(subprocess.run" not in content
+
+
+def test_run_test_subprocess_never_delegates_to_mocked_subprocess_run():
+    """_run_test_subprocess must not detect or delegate to mocked subprocess.run; it always uses Popen."""
+    ws = Workspace(repo_dir=Path.cwd())
+    with patch("subprocess.run") as mock_run, patch("subprocess.Popen") as mock_popen:
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("out", "err")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        ws._run_test_subprocess(["echo", "hi"], cwd=Path.cwd(), timeout=5)
+
+        assert mock_run.call_count == 0
+        assert mock_popen.call_count == 1
+
+
+@pytest.mark.parametrize("bad_val", ["abc", "-5", "0"])
+def test_invalid_jev_test_timeout_logs_warning_and_falls_back_to_600(clean_repo, caplog, bad_val):
+    """Invalid JEV_TEST_TIMEOUT logs ONE warning naming variable and bad value, falling back to 600."""
+    import logging
+    with patch.dict(os.environ, {"JEV_TEST_TIMEOUT": bad_val}):
+        with caplog.at_level(logging.WARNING):
+            ws = Workspace(repo_dir=clean_repo)
+            assert ws.test_timeout == 600
+        # Assert exactly ONE warning naming JEV_TEST_TIMEOUT and the bad value
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and "JEV_TEST_TIMEOUT" in r.message]
+        assert len(warnings) == 1
+        assert bad_val in warnings[0].message
+
+
 def test_node_verify_uses_timeout_and_handles_timeout_failure(clean_repo):
     """node_verify uses workspace.run_tests and records verification_failed on test timeout."""
     # Ensure integration branch exists in clean_repo
@@ -358,7 +395,7 @@ def test_requirements_covers_all_third_party_imports_in_src():
                 if node.level == 0 and node.module:
                     src_imports.add(node.module.split(".")[0])
 
-    stdlib = set(sys.stdlib_module_names) | set(sys.builtin_module_names) | {"__future__", "_winapi"}
+    stdlib = set(getattr(sys, "stdlib_module_names", [])) | set(sys.builtin_module_names) | {"__future__", "_winapi"}
     own_modules = {"jev", "main"}
     third_party = src_imports - stdlib - own_modules
 
@@ -367,6 +404,8 @@ def test_requirements_covers_all_third_party_imports_in_src():
         "langchain_core": "langchain-core",
         "langchain_google_genai": "langchain-google-genai",
         "tomli": "tomli",
+        "typing_extensions": "typing-extensions",
+        "tomllib": "tomli",
     }
 
     missing = []

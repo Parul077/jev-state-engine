@@ -42,7 +42,7 @@ def test_char_package_json_npm(repo_dir):
     (repo_dir / "package.json").write_text(json.dumps({"scripts": {"test": "jest"}}), encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/npm"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/npm"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["npm", "test"]
@@ -55,7 +55,7 @@ def test_char_package_json_yarn(repo_dir):
     (repo_dir / "yarn.lock").write_text("", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/yarn"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/yarn"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["yarn", "test"]
@@ -68,7 +68,7 @@ def test_char_package_json_pnpm(repo_dir):
     (repo_dir / "pnpm-lock.yaml").write_text("", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/pnpm"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/pnpm"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["pnpm", "test"]
@@ -80,7 +80,7 @@ def test_char_package_json_tool_missing_env_not_ready(repo_dir):
     (repo_dir / "package.json").write_text(json.dumps({"scripts": {"test": "jest"}}), encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value=None), patch("subprocess.run") as mock_sub:
+    with patch("shutil.which", return_value=None), patch.object(Workspace, "_run_test_subprocess") as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.ENV_NOT_READY
         assert ws.last_test_run["command"] == ["npm", "test"]
@@ -113,7 +113,7 @@ def test_char_go_mod(repo_dir):
     (repo_dir / "go.mod").write_text("module example.com/foo\n\ngo 1.20\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/go"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/go"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["go", "test", "./..."]
@@ -125,7 +125,7 @@ def test_char_go_mod_tool_missing_env_not_ready(repo_dir):
     (repo_dir / "go.mod").write_text("module example.com/foo\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value=None), patch("subprocess.run") as mock_sub:
+    with patch("shutil.which", return_value=None), patch.object(Workspace, "_run_test_subprocess") as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.ENV_NOT_READY
         assert ws.last_test_run["command"] == ["go", "test", "./..."]
@@ -137,7 +137,7 @@ def test_char_go_mod_subprocess_exception_returns_failed(repo_dir):
     (repo_dir / "go.mod").write_text("module example.com/foo\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/go"), patch("subprocess.run", side_effect=OSError("Boom")):
+    with patch("shutil.which", return_value="/bin/go"), patch.object(Workspace, "_run_test_subprocess", side_effect=OSError("Boom")):
         outcome = ws.run_tests()
         assert outcome == TestOutcome.FAILED
         assert ws.last_test_run["command"] == ["go", "test", "./..."]
@@ -148,7 +148,7 @@ def test_char_cargo_toml(repo_dir):
     (repo_dir / "Cargo.toml").write_text("[package]\nname = \"foo\"\nversion = \"0.1.0\"\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/cargo"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/cargo"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["cargo", "test"]
@@ -160,7 +160,7 @@ def test_char_cargo_toml_tool_missing_env_not_ready(repo_dir):
     (repo_dir / "Cargo.toml").write_text("[package]\nname = \"foo\"\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value=None), patch("subprocess.run") as mock_sub:
+    with patch("shutil.which", return_value=None), patch.object(Workspace, "_run_test_subprocess") as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.ENV_NOT_READY
         assert ws.last_test_run["command"] == ["cargo", "test"]
@@ -172,7 +172,7 @@ def test_char_pom_xml_default_mvn(repo_dir):
     (repo_dir / "pom.xml").write_text("<project></project>", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/mvn"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/mvn"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["mvn", "test"]
@@ -190,7 +190,7 @@ def test_char_pom_xml_wrapper(repo_dir):
         expected_cmd = ["./mvnw", "test"]
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/resolved/mvnw"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/resolved/mvnw"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == expected_cmd
@@ -202,7 +202,7 @@ def test_char_pom_xml_tool_missing_env_not_ready(repo_dir):
     (repo_dir / "pom.xml").write_text("<project></project>", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value=None), patch("subprocess.run") as mock_sub:
+    with patch("shutil.which", return_value=None), patch.object(Workspace, "_run_test_subprocess") as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.ENV_NOT_READY
         assert ws.last_test_run["command"] == ["mvn", "test"]
@@ -214,7 +214,7 @@ def test_char_build_gradle_default(repo_dir):
     (repo_dir / "build.gradle").write_text("plugins {}", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/gradle"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/gradle"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["gradle", "test"]
@@ -226,7 +226,7 @@ def test_char_build_gradle_kts(repo_dir):
     (repo_dir / "build.gradle.kts").write_text("plugins {}", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/gradle"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/gradle"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["gradle", "test"]
@@ -244,7 +244,7 @@ def test_char_build_gradle_wrapper(repo_dir):
         expected_cmd = ["./gradlew", "test"]
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/resolved/gradlew"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/resolved/gradlew"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == expected_cmd
@@ -256,7 +256,7 @@ def test_char_build_gradle_tool_missing_env_not_ready(repo_dir):
     (repo_dir / "build.gradle").write_text("plugins {}", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value=None), patch("subprocess.run") as mock_sub:
+    with patch("shutil.which", return_value=None), patch.object(Workspace, "_run_test_subprocess") as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.ENV_NOT_READY
         assert ws.last_test_run["command"] == ["gradle", "test"]
@@ -268,7 +268,7 @@ def test_char_pytest_ini(repo_dir):
     (repo_dir / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == [sys.executable, "-m", "pytest", "-q"]
@@ -280,7 +280,7 @@ def test_char_pyproject_toml_pytest(repo_dir):
     (repo_dir / "pyproject.toml").write_text("[tool.pytest.ini_options]\nminversion = '6.0'\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == [sys.executable, "-m", "pytest", "-q"]
@@ -293,7 +293,7 @@ def test_char_python_test_file_pattern(repo_dir):
     (tests_dir / "test_app.py").write_text("def test_one(): pass\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == [sys.executable, "-m", "pytest", "-q"]
@@ -308,7 +308,7 @@ def test_char_pytest_returncode_5_no_tests_collected(repo_dir):
     proc.returncode = 5
     proc.stdout = "no tests collected"
     proc.stderr = ""
-    with patch("subprocess.run", return_value=proc):
+    with patch.object(Workspace, "_run_test_subprocess", return_value=proc):
         outcome = ws.run_tests()
         assert outcome == TestOutcome.NO_TESTS_COLLECTED
         assert ws.last_test_run["command"] == [sys.executable, "-m", "pytest", "-q"]
@@ -323,7 +323,7 @@ def test_char_pytest_returncode_1_failed(repo_dir):
     proc.returncode = 1
     proc.stdout = "1 failed"
     proc.stderr = ""
-    with patch("subprocess.run", return_value=proc):
+    with patch.object(Workspace, "_run_test_subprocess", return_value=proc):
         outcome = ws.run_tests()
         assert outcome == TestOutcome.FAILED
         assert ws.last_test_run["command"] == [sys.executable, "-m", "pytest", "-q"]
@@ -334,7 +334,7 @@ def test_char_terraform_validate(repo_dir):
     (repo_dir / "main.tf").write_text('resource "null_resource" "x" {}\n', encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/terraform"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/terraform"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["terraform", "validate"]
@@ -346,7 +346,7 @@ def test_char_terraform_tool_missing_env_not_ready(repo_dir):
     (repo_dir / "main.tf").write_text('resource "null_resource" "x" {}\n', encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value=None), patch("subprocess.run") as mock_sub:
+    with patch("shutil.which", return_value=None), patch.object(Workspace, "_run_test_subprocess") as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.ENV_NOT_READY
         assert ws.last_test_run["command"] == ["terraform", "validate"]
@@ -361,7 +361,7 @@ def test_char_ansible_lint(repo_dir):
     def which_side_effect(cmd):
         return "/bin/ansible-lint" if cmd == "ansible-lint" else None
 
-    with patch("shutil.which", side_effect=which_side_effect), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", side_effect=which_side_effect), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["ansible-lint"]
@@ -376,7 +376,7 @@ def test_char_ansible_playbook_syntax_check(repo_dir):
     def which_side_effect(cmd):
         return "/bin/ansible-playbook" if cmd == "ansible-playbook" else None
 
-    with patch("shutil.which", side_effect=which_side_effect), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", side_effect=which_side_effect), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         expected_cmd = ["ansible-playbook", "--syntax-check", str(repo_dir / "playbook.yml")]
@@ -389,7 +389,7 @@ def test_char_ansible_tools_missing_env_not_ready(repo_dir):
     (repo_dir / "ansible.cfg").write_text("[defaults]\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value=None), patch("subprocess.run") as mock_sub:
+    with patch("shutil.which", return_value=None), patch.object(Workspace, "_run_test_subprocess") as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.ENV_NOT_READY
         assert ws.last_test_run["command"] == ["ansible-lint"]
@@ -401,7 +401,7 @@ def test_char_helm_lint(repo_dir):
     (repo_dir / "Chart.yaml").write_text("name: test\nversion: 0.1.0\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value="/bin/helm"), patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch("shutil.which", return_value="/bin/helm"), patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == ["helm", "lint", "."]
@@ -413,7 +413,7 @@ def test_char_helm_tool_missing_env_not_ready(repo_dir):
     (repo_dir / "Chart.yaml").write_text("name: test\nversion: 0.1.0\n", encoding="utf-8")
     ws = Workspace(repo_dir=repo_dir)
 
-    with patch("shutil.which", return_value=None), patch("subprocess.run") as mock_sub:
+    with patch("shutil.which", return_value=None), patch.object(Workspace, "_run_test_subprocess") as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.ENV_NOT_READY
         assert ws.last_test_run["command"] == ["helm", "lint", "."]
@@ -451,7 +451,7 @@ def test_resolve_test_command_returns_same_command_run_tests_executes(repo_dir):
     res = resolve_test_command(repo_dir)
     assert res.command == [sys.executable, "-m", "pytest", "-q"]
 
-    with patch("subprocess.run", return_value=_mock_success_process()) as mock_sub:
+    with patch.object(Workspace, "_run_test_subprocess", return_value=_mock_success_process()) as mock_sub:
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
         assert ws.last_test_run["command"] == res.command

@@ -1,5 +1,6 @@
 import ast
 import json
+import logging
 import os
 import re
 import shutil
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from jev.models import CompileOutcome, MechanicalCheckResult, Subgoal, TestOutcome
 
+logger = logging.getLogger(__name__)
 
 MAX_READ_CHARS = 40_000
 
@@ -32,18 +34,6 @@ def _run_test_subprocess(
     cwd: Union[str, Path],
     timeout: int,
 ) -> subprocess.CompletedProcess:
-    from unittest.mock import MagicMock, Mock
-    if isinstance(subprocess.run, (MagicMock, Mock)):
-        return subprocess.run(
-            cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-
     kwargs: Dict[str, Any] = {
         "cwd": cwd,
         "stdout": subprocess.PIPE,
@@ -702,6 +692,7 @@ class Workspace:
                         raise ValueError()
                     self.test_timeout = ival
                 except (ValueError, TypeError):
+                    logger.warning("Invalid JEV_TEST_TIMEOUT '%s': must be a positive integer; falling back to 600", env_val)
                     self.test_timeout = 600
             else:
                 self.test_timeout = 600

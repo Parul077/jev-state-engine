@@ -396,7 +396,7 @@ def test_run_tests_detects_package_json_yarn(git_repo):
     pkg.write_text('{"scripts": {"test": "jest"}}', encoding="utf-8")
     (git_repo / "yarn.lock").write_text("", encoding="utf-8")
 
-    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch.object(Workspace, "_run_test_subprocess") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["yarn", "test"], returncode=0, stdout="pass", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -404,8 +404,7 @@ def test_run_tests_detects_package_json_yarn(git_repo):
         args = mock_run.call_args[0][0]
         assert args == ["yarn", "test"]
         kwargs = mock_run.call_args[1]
-        assert kwargs.get("encoding") == "utf-8"
-        assert kwargs.get("errors") == "replace"
+        assert kwargs.get("timeout") == ws.test_timeout
 
 
 # 22. test_run_tests_detects_package_json_pnpm
@@ -416,7 +415,7 @@ def test_run_tests_detects_package_json_pnpm(git_repo):
     pkg.write_text('{"scripts": {"test": "vitest"}}', encoding="utf-8")
     (git_repo / "pnpm-lock.yaml").write_text("", encoding="utf-8")
 
-    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch.object(Workspace, "_run_test_subprocess") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["pnpm", "test"], returncode=0, stdout="pass", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -433,7 +432,7 @@ def test_run_tests_detects_package_json_npm(git_repo):
     pkg.write_text('{"scripts": {"test": "mocha"}}', encoding="utf-8")
     (git_repo / "package-lock.json").write_text("{}", encoding="utf-8")
 
-    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch.object(Workspace, "_run_test_subprocess") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["npm", "test"], returncode=0, stdout="pass", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -448,7 +447,7 @@ def test_run_tests_detects_go_mod(git_repo):
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "go.mod").write_text("module example.com/m\n", encoding="utf-8")
 
-    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch.object(Workspace, "_run_test_subprocess") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["go", "test", "./..."], returncode=0, stdout="ok", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -463,7 +462,7 @@ def test_run_tests_detects_cargo_toml(git_repo):
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "Cargo.toml").write_text("[package]\nname = \"foo\"\n", encoding="utf-8")
 
-    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch.object(Workspace, "_run_test_subprocess") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["cargo", "test"], returncode=0, stdout="ok", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -478,7 +477,7 @@ def test_run_tests_detects_pom_xml(git_repo):
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "pom.xml").write_text("<project></project>", encoding="utf-8")
 
-    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch.object(Workspace, "_run_test_subprocess") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["mvn", "test"], returncode=0, stdout="ok", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -494,7 +493,7 @@ def test_run_tests_detects_build_gradle(git_repo):
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "build.gradle").write_text("// gradle", encoding="utf-8")
 
-    with patch("shutil.which", side_effect=lambda x: x), patch("subprocess.run") as mock_run:
+    with patch("shutil.which", side_effect=lambda x: x), patch.object(Workspace, "_run_test_subprocess") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["gradle", "test"], returncode=0, stdout="ok", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -510,7 +509,7 @@ def test_run_tests_detects_pytest_signals(git_repo):
     ws = Workspace(repo_dir=git_repo)
     (git_repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
 
-    with patch("subprocess.run") as mock_run:
+    with patch.object(Workspace, "_run_test_subprocess") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=["pytest", "-q"], returncode=0, stdout="ok", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
@@ -581,7 +580,7 @@ def test_run_tests_resolves_windows_cmd_bat_and_executes_resolved_path(git_repo)
     (git_repo / "package-lock.json").write_text("{}", encoding="utf-8")
 
     fake_resolved_npm = r"C:\Program Files\nodejs\npm.CMD"
-    with patch("shutil.which", return_value=fake_resolved_npm), patch("subprocess.run") as mock_run:
+    with patch("shutil.which", return_value=fake_resolved_npm), patch.object(Workspace, "_run_test_subprocess") as mock_run:
         mock_run.return_value = subprocess.CompletedProcess(args=[fake_resolved_npm, "test"], returncode=0, stdout="pass", stderr="")
         outcome = ws.run_tests()
         assert outcome == TestOutcome.PASSED
