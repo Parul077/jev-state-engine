@@ -57,6 +57,7 @@ class Recorder(Protocol):
         retry_intel: Optional[str] = None,
         repo_profile: Optional[str] = None,
         profile_chars: Optional[int] = None,
+        dep_delta_jev: Optional[str] = None,
     ) -> None: ...
 
 
@@ -117,6 +118,7 @@ class Recorder(Protocol):
         created_at: Optional[str] = None,
         evidence_level: Optional[str] = None,
         dependency_delta: Optional[str] = None,
+        jev_state_keys: Optional[str] = None,
     ) -> None: ...
 
     def has_run(self, run_id: str) -> bool: ...
@@ -143,6 +145,7 @@ class NullRecorder:
         retry_intel: Optional[str] = None,
         repo_profile: Optional[str] = None,
         profile_chars: Optional[int] = None,
+        dep_delta_jev: Optional[str] = None,
     ) -> None:
         pass
 
@@ -208,6 +211,7 @@ class NullRecorder:
         created_at: Optional[str] = None,
         evidence_level: Optional[str] = None,
         dependency_delta: Optional[str] = None,
+        jev_state_keys: Optional[str] = None,
     ) -> None:
         pass
 
@@ -267,7 +271,8 @@ class SqliteLedger:
                   started_at TEXT,
                   ended_at TEXT,
                   notes_chars INTEGER,
-                  dependency_delta TEXT
+                  dependency_delta TEXT,
+                  dep_delta_jev TEXT DEFAULT NULL
                 );
                 """
             )
@@ -285,6 +290,8 @@ class SqliteLedger:
                 conn.execute("ALTER TABLE runs ADD COLUMN profile_chars INTEGER DEFAULT NULL")
             if "dependency_delta" not in cols:
                 conn.execute("ALTER TABLE runs ADD COLUMN dependency_delta TEXT DEFAULT NULL")
+            if "dep_delta_jev" not in cols:
+                conn.execute("ALTER TABLE runs ADD COLUMN dep_delta_jev TEXT DEFAULT NULL")
 
             conn.execute(
                 """
@@ -329,6 +336,7 @@ class SqliteLedger:
                   created_at TEXT,
                   evidence_level TEXT,
                   dependency_delta TEXT,
+                  jev_state_keys TEXT DEFAULT NULL,
                   PRIMARY KEY (run_id, subgoal_id, attempt_no)
                 );
                 """
@@ -338,6 +346,8 @@ class SqliteLedger:
                 conn.execute("ALTER TABLE attempts ADD COLUMN evidence_level TEXT DEFAULT NULL")
             if "dependency_delta" not in att_cols:
                 conn.execute("ALTER TABLE attempts ADD COLUMN dependency_delta TEXT DEFAULT NULL")
+            if "jev_state_keys" not in att_cols:
+                conn.execute("ALTER TABLE attempts ADD COLUMN jev_state_keys TEXT DEFAULT NULL")
 
     def has_run(self, run_id: str) -> bool:
         with self._get_connection() as conn:
@@ -357,15 +367,18 @@ class SqliteLedger:
         retry_intel: Optional[str] = None,
         repo_profile: Optional[str] = None,
         profile_chars: Optional[int] = None,
+        dep_delta_jev: Optional[str] = None,
     ) -> None:
         start_time = started_at or datetime.now(timezone.utc).isoformat()
+        if not isinstance(dep_delta_jev, str):
+            dep_delta_jev = "off"
         with self._get_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO runs (
                   run_id, thread_id, ticket, base_commit, engine_commit,
-                  worker_model, test_policy, retry_intel, repo_profile, profile_chars, status, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?)
+                  worker_model, test_policy, retry_intel, repo_profile, profile_chars, status, started_at, dep_delta_jev
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                   thread_id=excluded.thread_id,
                   ticket=excluded.ticket,
@@ -377,7 +390,8 @@ class SqliteLedger:
                   repo_profile=excluded.repo_profile,
                   profile_chars=excluded.profile_chars,
                   status='in_progress',
-                  started_at=excluded.started_at
+                  started_at=excluded.started_at,
+                  dep_delta_jev=excluded.dep_delta_jev
                 """,
                 (
                     run_id,
@@ -391,6 +405,7 @@ class SqliteLedger:
                     repo_profile or "off",
                     profile_chars,
                     start_time,
+                    dep_delta_jev or "off",
                 ),
             )
 
@@ -535,8 +550,11 @@ class SqliteLedger:
         created_at: Optional[str] = None,
         evidence_level: Optional[str] = None,
         dependency_delta: Optional[str] = None,
+        jev_state_keys: Optional[str] = None,
     ) -> None:
         now_ts = created_at or datetime.now(timezone.utc).isoformat()
+        if not isinstance(jev_state_keys, str):
+            jev_state_keys = None
         if not diff_sha:
             diff_sha = hashlib.sha256(diff.encode("utf-8")).hexdigest() if diff else hashlib.sha256(b"").hexdigest()
 
@@ -565,8 +583,8 @@ class SqliteLedger:
                   jev_valid, jev_probability, jev_model, jev_raw,
                   jev_tokens_in, jev_tokens_out,
                   feedback_sent, tokens_in, tokens_out, created_at,
-                  evidence_level, dependency_delta
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  evidence_level, dependency_delta, jev_state_keys
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -593,6 +611,7 @@ class SqliteLedger:
                     now_ts,
                     evidence_level,
                     dependency_delta,
+                    jev_state_keys,
                 ),
             )
 

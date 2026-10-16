@@ -92,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Timeout in seconds for test suite execution (positive integer; defaults to JEV_TEST_TIMEOUT or 600).",
     )
+    parser.add_argument(
+        "--dep-delta-jev",
+        choices=["on", "off"],
+        default="off",
+        help="Send dependency delta to Jev as state evidence (on, off; defaults to off).",
+    )
     return parser
 
 
@@ -148,6 +154,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         test_policy=args.test_policy,
         retry_intel=args.retry_intel,
         repo_profile=args.repo_profile,
+        dep_delta_jev=args.dep_delta_jev,
     )
 
 

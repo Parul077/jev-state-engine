@@ -53,6 +53,8 @@ class Gatekeeper:
         self.timeout = timeout
         self.client = httpx.Client(timeout=self.timeout)
         self._valid_only_mode: bool = False
+        self._dep_delta_unsupported: bool = False
+        self.last_state_keys: Optional[str] = None
 
     def _post_with_retry(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         headers = {
@@ -114,6 +116,7 @@ class Gatekeeper:
         diff: str,
         mechanical_detail: str = "",
         investigation_notes: Optional[str] = None,
+        dependency_delta: Optional[Dict[str, Any]] = None,
     ) -> ValidationVerdict:
         """Tier 1 validation using Jev System One model."""
         state: Dict[str, Any] = {
@@ -130,6 +133,19 @@ class Gatekeeper:
             state["mechanical_detail"] = mechanical_detail
         elif mechanical_detail:
             state["mechanical_detail"] = mechanical_detail
+
+        if dependency_delta is not None and not self._dep_delta_unsupported:
+            delta_dict = dict(dependency_delta)
+            dropped = 0
+            for k in ("added", "removed", "changed"):
+                if k in delta_dict and isinstance(delta_dict[k], list):
+                    items = delta_dict[k]
+                    if len(items) > 50:
+                        dropped += len(items) - 50
+                        delta_dict[k] = items[:50]
+            if dropped > 0:
+                delta_dict["truncated"] = dropped
+            state["dependency_delta"] = delta_dict
 
         questions = {
             "valid": {
@@ -169,7 +185,31 @@ class Gatekeeper:
                     "valid": questions["valid"]
                 },
             }
-            data = self._post_with_retry(fallback_payload)
+            try:
+                data = self._post_with_retry(fallback_payload)
+                self.last_state_keys = ",".join(state.keys())
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (400, 422) and "dependency_delta" in state:
+                    self._dep_delta_unsupported = True
+                    status_code = e.response.status_code
+                    body_truncated = (e.response.text or "")[:500]
+                    logger.warning(
+                        f"Jev API returned HTTP {status_code}: {body_truncated}. "
+                        "dependency_delta is unsupported and will not be sent again."
+                    )
+                    state_no_delta = dict(state)
+                    del state_no_delta["dependency_delta"]
+                    fallback_payload2 = {
+                        "model": "jev-latest",
+                        "state": state_no_delta,
+                        "questions": {
+                            "valid": questions["valid"]
+                        },
+                    }
+                    data = self._post_with_retry(fallback_payload2)
+                    self.last_state_keys = ",".join(state_no_delta.keys())
+                else:
+                    raise
             return self._parse_noul_verdict(data)
 
         payload = {
@@ -180,8 +220,47 @@ class Gatekeeper:
 
         try:
             data = self._post_with_retry(payload)
+            self.last_state_keys = ",".join(state.keys())
         except httpx.HTTPStatusError as e:
-            if e.response.status_code in (400, 422):
+            if e.response.status_code in (400, 422) and "dependency_delta" in state:
+                self._dep_delta_unsupported = True
+                status_code = e.response.status_code
+                body_truncated = (e.response.text or "")[:500]
+                logger.warning(
+                    f"Jev API returned HTTP {status_code}: {body_truncated}. "
+                    "dependency_delta is unsupported and will not be sent again."
+                )
+                state_no_delta = dict(state)
+                del state_no_delta["dependency_delta"]
+                retry_payload = {
+                    "model": "jev-latest",
+                    "state": state_no_delta,
+                    "questions": questions,
+                }
+                try:
+                    data = self._post_with_retry(retry_payload)
+                    self.last_state_keys = ",".join(state_no_delta.keys())
+                except httpx.HTTPStatusError as e2:
+                    if e2.response.status_code in (400, 422):
+                        self._valid_only_mode = True
+                        status_code2 = e2.response.status_code
+                        body_truncated2 = (e2.response.text or "")[:500]
+                        logger.warning(
+                            f"Jev API returned HTTP {status_code2}: {body_truncated2}. "
+                            "Retry intelligence is degraded and Gatekeeper is now valid-only for this instance."
+                        )
+                        fallback_payload = {
+                            "model": "jev-latest",
+                            "state": state_no_delta,
+                            "questions": {
+                                "valid": questions["valid"]
+                            },
+                        }
+                        data = self._post_with_retry(fallback_payload)
+                        self.last_state_keys = ",".join(state_no_delta.keys())
+                    else:
+                        raise
+            elif e.response.status_code in (400, 422):
                 self._valid_only_mode = True
                 status_code = e.response.status_code
                 body_truncated = (e.response.text or "")[:500]
@@ -197,6 +276,7 @@ class Gatekeeper:
                     },
                 }
                 data = self._post_with_retry(fallback_payload)
+                self.last_state_keys = ",".join(state.keys())
             else:
                 raise
 
@@ -358,6 +438,7 @@ class Gatekeeper:
                 }
             },
         }
+        self.last_state_keys = ",".join(state.keys())
         data = self._post_with_retry(payload)
         return self._parse_noul_verdict(data)
 

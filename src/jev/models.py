@@ -89,6 +89,7 @@ class State(TypedDict, total=False):
     retry_intel: Optional[str]
     repo_profile: Optional[str]
     repo_profile_text: Optional[str]
+    dep_delta_jev: Optional[str]
 
 
 

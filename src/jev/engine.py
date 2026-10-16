@@ -2161,10 +2161,13 @@ def _snapshot_attempt(
     feedback_sent: Optional[str] = None,
     evidence_level: Optional[str] = None,
     dependency_delta: Optional[str] = None,
+    jev_state_keys: Optional[str] = None,
 ) -> None:
     """Helper to snapshot an attempt row to the ledger."""
     if not recorder:
         return
+    if not isinstance(jev_state_keys, str):
+        jev_state_keys = None
     safe_rec = recorder if isinstance(recorder, SafeRecorder) else SafeRecorder(recorder)
     run_id = state.get("run_id") or state.get("thread_id") or "unknown"
     if isinstance(diff, str):
@@ -2222,6 +2225,7 @@ def _snapshot_attempt(
         tokens_out=state.get("worker_tokens_out") if subgoal_id != "__verify__" else None,
         evidence_level=evidence_level,
         dependency_delta=dependency_delta,
+        jev_state_keys=jev_state_keys,
     )
 
 
@@ -2560,26 +2564,39 @@ def node_gate(
         test_policy=state.get("test_policy"),
     )
 
+    attempt_dep_delta_obj = None
     attempt_dep_delta = None
     if workspace is not None and hasattr(workspace, "get_manifest_changes"):
         try:
             changes = workspace.get_manifest_changes("HEAD")
             delta = compute_dependency_delta(changes)
+            attempt_dep_delta_obj = delta
             attempt_dep_delta = delta.to_json()
         except Exception as e:
             logger.warning(f"{type(e).__name__}: {e}")
+            attempt_dep_delta_obj = None
             attempt_dep_delta = None
 
     inv_notes = state.get("investigation_notes")
 
+    dep_delta_flag = state.get("dep_delta_jev", "off")
+    pass_delta = False
+    if dep_delta_flag == "on" and attempt_dep_delta_obj is not None:
+        if (not attempt_dep_delta_obj.is_empty) or bool(attempt_dep_delta_obj.unparsed):
+            pass_delta = True
+
+    gate_kwargs: Dict[str, Any] = {}
     if _accepts_param(gatekeeper.validate_subgoal, "investigation_notes"):
-        verdict = gatekeeper.validate_subgoal(
-            subgoal, diff, mechanical_detail=mech_result.detail, investigation_notes=inv_notes
-        )
-    else:
-        verdict = gatekeeper.validate_subgoal(
-            subgoal, diff, mechanical_detail=mech_result.detail
-        )
+        gate_kwargs["investigation_notes"] = inv_notes
+    if pass_delta and _accepts_param(gatekeeper.validate_subgoal, "dependency_delta"):
+        gate_kwargs["dependency_delta"] = attempt_dep_delta_obj.model_dump()
+
+    verdict = gatekeeper.validate_subgoal(
+        subgoal, diff, mechanical_detail=mech_result.detail, **gate_kwargs
+    )
+    jev_keys = getattr(gatekeeper, "last_state_keys", None)
+    if not isinstance(jev_keys, str):
+        jev_keys = None
 
     jev_request_telemetry = {
         "subgoal": subgoal.model_dump() if hasattr(subgoal, "model_dump") else dict(subgoal),
@@ -2610,7 +2627,7 @@ def node_gate(
                 _snapshot_attempt(
                     safe_rec, state, subgoal_id, tier="merge", outcome="merge_failed",
                     diff=diff, feedback_sent=err_msg, evidence_level=ev_level,
-                    dependency_delta=attempt_dep_delta,
+                    dependency_delta=attempt_dep_delta, jev_state_keys=jev_keys,
                 )
                 _teardown_worktree(state, workspace)
                 subgoal.status = "failed"
@@ -2653,7 +2670,7 @@ def node_gate(
                 _snapshot_attempt(
                     safe_rec, state, subgoal_id, tier="merge", outcome="merge_failed",
                     diff=diff, feedback_sent=str(e), evidence_level=ev_level,
-                    dependency_delta=attempt_dep_delta,
+                    dependency_delta=attempt_dep_delta, jev_state_keys=jev_keys,
                 )
                 _teardown_worktree(state, workspace)
                 subgoal.status = "failed"
@@ -2679,7 +2696,7 @@ def node_gate(
             _snapshot_attempt(
                 safe_rec, state, subgoal_id, tier="worktree", outcome="worktree_state_missing",
                 diff=diff, feedback_sent=err_msg, evidence_level=ev_level,
-                dependency_delta=attempt_dep_delta,
+                dependency_delta=attempt_dep_delta, jev_state_keys=jev_keys,
             )
             _teardown_worktree(state, workspace)
             subgoal.status = "failed"
@@ -2736,6 +2753,7 @@ def node_gate(
             feedback_sent="",
             evidence_level=ev_level,
             dependency_delta=attempt_dep_delta,
+            jev_state_keys=jev_keys,
         )
         if safe_rec:
             safe_rec.record_subgoal_committed(run_id, subgoal_id, parent_sha=parent_sha, commit_sha=commit_sha)
@@ -2798,6 +2816,7 @@ def node_gate(
             feedback_sent=state.get("last_feedback"),
             evidence_level=ev_level,
             dependency_delta=attempt_dep_delta,
+            jev_state_keys=jev_keys,
         )
         _teardown_worktree(state, workspace)
 
@@ -3027,6 +3046,10 @@ def node_verify(
             else:
                 verdict = gatekeeper.verify_ticket(ticket, final_diff, test_output)
 
+            verify_keys = getattr(gatekeeper, "last_state_keys", None)
+            if not isinstance(verify_keys, str):
+                verify_keys = None
+
             if verdict.valid:
                 # Discard verify worktree safely first
                 if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
@@ -3062,6 +3085,7 @@ def node_verify(
                     verdict=verdict,
                     feedback_sent="",
                     evidence_level=verify_ev_level,
+                    jev_state_keys=verify_keys,
                 )
             else:
                 state["gate_status"] = "verification_failed"
@@ -3097,6 +3121,7 @@ def node_verify(
                     verdict=verdict,
                     feedback_sent=state.get("last_feedback"),
                     evidence_level=verify_ev_level,
+                    jev_state_keys=verify_keys,
                 )
         else:
             if verify_wt_path and hasattr(workspace, "discard_verify_worktree"):
@@ -3302,6 +3327,7 @@ class JevEngine:
         recorder: Optional[Any] = None,
         retry_intel: str = "on",
         repo_profile: str = "off",
+        dep_delta_jev: str = "off",
     ):
         self.workspace = workspace
         self.gatekeeper = gatekeeper
@@ -3309,6 +3335,7 @@ class JevEngine:
         self.test_policy = test_policy
         self.retry_intel = retry_intel
         self.repo_profile = repo_profile
+        self.dep_delta_jev = dep_delta_jev
         if recorder is None:
             self.recorder = SafeRecorder(NullRecorder())
         elif isinstance(recorder, SafeRecorder):
@@ -3482,6 +3509,7 @@ class JevEngine:
             retry_intel=self.retry_intel,
             repo_profile=self.repo_profile,
             profile_chars=profile_chars,
+            dep_delta_jev=self.dep_delta_jev,
         )
 
         initial_state: State = {
@@ -3495,6 +3523,7 @@ class JevEngine:
             "retry_intel": self.retry_intel,
             "repo_profile": self.repo_profile,
             "repo_profile_text": profile_text,
+            "dep_delta_jev": self.dep_delta_jev,
             "failed_attempts": [],
             "plan_queue": [],
             "current_subgoal": None,
