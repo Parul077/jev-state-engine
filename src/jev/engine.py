@@ -651,7 +651,6 @@ def node_investigate(
     workspace: Optional[Any] = None,
     llm: Optional[Any] = None,
     max_investigation_turns: int = 20,
-    max_turns: Optional[int] = None,
 ) -> State:
     """State 1: INVESTIGATION (Read-Only access to codebase)."""
     if "trajectory" not in state or state["trajectory"] is None:
@@ -852,8 +851,7 @@ def node_investigate(
     messages: List[Any] = [HumanMessage(content=prompt_text)]
     bound_llm = llm.bind_tools(tools)
 
-    if max_turns is None:
-        max_turns = max_investigation_turns
+    max_turns = max_investigation_turns
     turn = 0
 
     while turn < max_turns and not finished:

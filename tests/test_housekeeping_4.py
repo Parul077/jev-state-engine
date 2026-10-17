@@ -249,12 +249,17 @@ def test_worker_model_reaches_chat_google_generative_ai_constructor(clean_repo):
     """The resolved model name reaches the ChatGoogleGenerativeAI constructor."""
     parser = main.build_parser()
     with patch("langchain_google_genai.ChatGoogleGenerativeAI") as mock_chat_cls, \
-         patch("main.JevEngine") as mock_engine_cls:
+         patch("main.JevEngine") as mock_engine_cls, \
+         patch("main.Gatekeeper") as mock_gatekeeper_cls:
         mock_engine_instance = MagicMock()
         mock_engine_instance.execute.return_value = {"status": "completed"}
         mock_engine_cls.return_value = mock_engine_instance
 
+        # Decouple from developer environment: JEV_API_URL and JEV_API_KEY are unset
         with patch.dict(os.environ, {"GOOGLE_API_KEY": "fake-key", "JEV_WORKER_MODEL": "model-from-env"}):
+            os.environ.pop("JEV_API_URL", None)
+            os.environ.pop("JEV_API_KEY", None)
+
             # 1. Env model
             main.main(["ticket-test", "--repo-dir", str(clean_repo), "--no-ledger"])
             mock_chat_cls.assert_called_with(
