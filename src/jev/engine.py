@@ -650,6 +650,8 @@ def node_investigate(
     state: State,
     workspace: Optional[Any] = None,
     llm: Optional[Any] = None,
+    max_investigation_turns: int = 20,
+    max_turns: Optional[int] = None,
 ) -> State:
     """State 1: INVESTIGATION (Read-Only access to codebase)."""
     if "trajectory" not in state or state["trajectory"] is None:
@@ -850,7 +852,8 @@ def node_investigate(
     messages: List[Any] = [HumanMessage(content=prompt_text)]
     bound_llm = llm.bind_tools(tools)
 
-    max_turns = 10 if (hasattr(llm, "responses") and len(getattr(llm, "responses", [])) == 15) else 20
+    if max_turns is None:
+        max_turns = max_investigation_turns
     turn = 0
 
     while turn < max_turns and not finished:
@@ -3328,6 +3331,7 @@ class JevEngine:
         retry_intel: str = "on",
         repo_profile: str = "off",
         dep_delta_jev: str = "off",
+        max_investigation_turns: int = 20,
     ):
         self.workspace = workspace
         self.gatekeeper = gatekeeper
@@ -3336,6 +3340,7 @@ class JevEngine:
         self.retry_intel = retry_intel
         self.repo_profile = repo_profile
         self.dep_delta_jev = dep_delta_jev
+        self.max_investigation_turns = max_investigation_turns
         if recorder is None:
             self.recorder = SafeRecorder(NullRecorder())
         elif isinstance(recorder, SafeRecorder):
@@ -3353,7 +3358,12 @@ class JevEngine:
         self.app = self.build_graph()
 
     def _node_investigate(self, state: State) -> State:
-        return node_investigate(state, workspace=self.workspace, llm=self.llm)
+        return node_investigate(
+            state,
+            workspace=self.workspace,
+            llm=self.llm,
+            max_investigation_turns=self.max_investigation_turns,
+        )
 
     def _node_plan(self, state: State) -> State:
         return node_plan(state, workspace=self.workspace, llm=self.llm, gatekeeper=self.gatekeeper, recorder=self.recorder)
@@ -3553,15 +3563,18 @@ class JevEngine:
         notes_chars = len(inv_notes)
 
         run_dep_delta = None
-        if final_status == "completed" and final_commit and base_commit and final_commit != base_commit:
-            if self.workspace is not None and hasattr(self.workspace, "get_manifest_changes"):
-                try:
-                    changes = self.workspace.get_manifest_changes(base_commit, final_commit)
-                    delta = compute_dependency_delta(changes)
-                    run_dep_delta = delta.to_json()
-                except Exception as e:
-                    logger.warning(f"{type(e).__name__}: {e}")
-                    run_dep_delta = None
+        if final_status == "completed" and final_commit and base_commit:
+            if final_commit != base_commit:
+                if self.workspace is not None and hasattr(self.workspace, "get_manifest_changes"):
+                    try:
+                        changes = self.workspace.get_manifest_changes(base_commit, final_commit)
+                        delta = compute_dependency_delta(changes)
+                        run_dep_delta = delta.to_json()
+                    except Exception as e:
+                        logger.warning(f"{type(e).__name__}: {e}")
+                        run_dep_delta = None
+            else:
+                run_dep_delta = compute_dependency_delta({}).to_json()
 
         self.recorder.record_run_end(
             run_id=run_id,

@@ -18,6 +18,9 @@ import uuid
 from datetime import datetime, timezone
 
 
+DEFAULT_WORKER_MODEL = "gemini-3.5-flash-lite"
+
+
 def generate_default_thread_id() -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     rnd = uuid.uuid4().hex[:4]
@@ -32,6 +35,25 @@ def positive_int(value: str) -> int:
     except (ValueError, TypeError):
         raise argparse.ArgumentTypeError(f"'{value}' is not a positive integer")
     return val
+
+
+def non_empty_str(value: str) -> str:
+    if value is None or not value.strip():
+        raise argparse.ArgumentTypeError("Model name cannot be empty or whitespace-only")
+    return value.strip()
+
+
+def resolve_worker_model(cli_model: Optional[str] = None) -> str:
+    if cli_model is not None:
+        if not cli_model.strip():
+            raise argparse.ArgumentTypeError("Model name cannot be empty or whitespace-only")
+        return cli_model.strip()
+    env_model = os.environ.get("JEV_WORKER_MODEL")
+    if env_model is not None:
+        if not env_model.strip():
+            raise argparse.ArgumentTypeError("JEV_WORKER_MODEL cannot be empty or whitespace-only")
+        return env_model.strip()
+    return DEFAULT_WORKER_MODEL
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,6 +120,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="off",
         help="Send dependency delta to Jev as state evidence (on, off; defaults to off).",
     )
+    parser.add_argument(
+        "--model",
+        type=non_empty_str,
+        default=None,
+        help="Worker LLM model name (defaults to JEV_WORKER_MODEL or gemini-3.5-flash-lite).",
+    )
     return parser
 
 
@@ -105,6 +133,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    try:
+        model = resolve_worker_model(args.model)
+    except argparse.ArgumentTypeError as e:
+        parser.error(str(e))
 
     repo_dir = Path(args.repo_dir).resolve() if args.repo_dir else Path.cwd().resolve()
 
@@ -125,7 +158,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"ledger disabled: {e}", file=sys.stderr, flush=True)
             recorder = NullRecorder()
 
-    # Wire Gemini LLM (gemini-3.5-flash-lite) via langchain-google-genai
+    # Wire Gemini LLM via langchain-google-genai
     google_api_key = os.environ.get("GOOGLE_API_KEY")
     if not google_api_key and env_file and env_file.exists():
         parsed_env = dotenv_values(env_file)
@@ -138,7 +171,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             from langchain_google_genai import ChatGoogleGenerativeAI
 
             llm = ChatGoogleGenerativeAI(
-                model="gemini-3.5-flash-lite",
+                model=model,
                 google_api_key=google_api_key,
             )
         except Exception as e:
