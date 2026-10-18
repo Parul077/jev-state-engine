@@ -4,17 +4,17 @@ A deterministic, finite-state machine (FSM) runtime that orchestrates autonomous
 
 ```mermaid
 flowchart TD
-    START([Start]) --> Investigate["1. Investigation<br/><i>Read-Only Code Exploration</i>"]
-    Investigate --> Plan["2. Planning<br/><i>Grounding & Subgoal Generation</i>"]
+    START([Start]) --> Investigate["1. Investigation<br/>(Read-Only Code Exploration)"]
+    Investigate --> Plan["2. Planning<br/>(Grounding and Subgoal Generation)"]
     
-    Plan -->|Valid Plan| Implement["3. Implementation<br/><i>Isolated Git Worktree</i>"]
-    Plan -->|Planning Failed| Escalate["5. Escalation<br/><i>Deadlock HITL Log</i>"]
+    Plan -->|Valid Plan| Implement["3. Implementation<br/>(Isolated Git Worktree)"]
+    Plan -->|Planning Failed| Escalate["5. Escalation<br/>(Deadlock HITL Log)"]
     
-    Implement --> Gate{"4. Two-Tier Gate<br/><i>Mechanical & Semantic</i>"}
+    Implement --> Gate{"4. Two-Tier Gate<br/>(Mechanical and Semantic)"}
     
-    Gate -->|Passed & More Subgoals| Implement
-    Gate -->|Passed & Queue Empty| Verify["4b. Verification<br/><i>Test Suite & Final Diff</i>"]
-    Gate -->|Strike Limit Reached / Merge Error| Escalate
+    Gate -->|Passed and More Subgoals| Implement
+    Gate -->|Passed and Queue Empty| Verify["4b. Verification<br/>(Test Suite and Final Diff)"]
+    Gate -->|Strike Limit Reached or Merge Error| Escalate
     Gate -->|Retry Subgoal| Implement
     
     Verify -->|Verified| END([Completed])
@@ -90,16 +90,16 @@ Before any code commits to the base repository, it must clear two independent ve
 ```mermaid
 flowchart LR
     SubgoalDiff["Staged Worktree Diff"] --> Tier0{"Tier 0: Mechanical Gate"}
-    Tier0 -->|Fails AST / Scope / Tests| MechStrike["+1 Mechanical Strike<br/>(Max 3)"]
+    Tier0 -->|Fails AST, Scope, or Tests| MechStrike["+1 Mechanical Strike<br/>(Max 3)"]
     Tier0 -->|Passes| Tier1{"Tier 1: Semantic Gate<br/>(TypeSafe AI Jev System One)"}
     
-    Tier1 -->|Rejected: prob < 0.5| SemStrike["+1 Semantic Strike<br/>(Max 3)"]
-    Tier1 -->|Valid: prob >= 0.5| Merge["Fast-Forward Merge &<br/>Reset Strike Counters to 0"]
+    Tier1 -->|Rejected: prob under 0.5| SemStrike["+1 Semantic Strike<br/>(Max 3)"]
+    Tier1 -->|Valid: prob 0.5 or higher| Merge["Fast-Forward Merge and<br/>Reset Strike Counters to 0"]
     
-    MechStrike -->|Counter >= 3| Escalate["Escalate Deadlock"]
-    SemStrike -->|Counter >= 3| Escalate
-    MechStrike -->|Counter < 3| Retry["Rollback Worktree & Retry Subgoal"]
-    SemStrike -->|Counter < 3| Retry
+    MechStrike -->|Counter at least 3| Escalate["Escalate Deadlock"]
+    SemStrike -->|Counter at least 3| Escalate
+    MechStrike -->|Counter under 3| Retry["Rollback Worktree and Retry Subgoal"]
+    SemStrike -->|Counter under 3| Retry
 ```
 
 ### Tier 0: Mechanical Gating
@@ -126,7 +126,7 @@ When Tier 0 passes, the staged diff is sent to TypeSafe AI's Jev System One clas
 * **Target Endpoint:** Configured via `JEV_API_URL` (defaulting to `https://api.typesafe.ai/v1/systemone`).
 * **Calibrated Boolean Question (`noul`):** Queries `jev-latest` with the subgoal description, declared scope, staged diff, and investigation context:
   > *"Does the diff fully and correctly implement the subgoal described in state, without exceeding its declared scope?"*
-* **Probability Verdict:** Evaluates the calibrated probability score (valid when $\ge 0.5$ or explicit boolean verdict). The gatekeeper ensures the diff implements the feature completely and correctly without side-effects or style-guide violations.
+* **Probability Verdict:** Evaluates the calibrated probability score (valid when >= 0.5 or explicit boolean verdict). The gatekeeper ensures the diff implements the feature completely and correctly without side-effects or style-guide violations.
 
 ### Independent Strike Counters
 * `mechanical_strike_count` (budget: 3 strikes)
