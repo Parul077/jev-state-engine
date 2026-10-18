@@ -6,6 +6,10 @@ from typing import List, Optional
 
 from dotenv import dotenv_values
 
+_src_dir = str(Path(__file__).resolve().parent)
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+
 from jev.dependency_delta import format_dependency_summary
 from jev.engine import JevEngine
 from jev.evidence import format_evidence_summary
