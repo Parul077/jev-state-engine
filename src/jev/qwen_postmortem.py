@@ -146,6 +146,8 @@ def format_postmortem_prompt(
     strike_number: str,
     previous_strikes: Optional[List[Dict[str, Any]]] = None,
     max_diff_chars: int = DEFAULT_QWEN_MAX_DIFF_CHARS,
+    subgoal_description: Optional[str] = None,
+    subgoal_scope: Optional[List[str]] = None,
 ) -> str:
     """Constructs a deterministic prompt for Qwen post-mortem analysis."""
     # 1. Truncate diff with explicit marker if needed
@@ -189,10 +191,17 @@ def format_postmortem_prompt(
             items.append(f"- Strike {s_no}: Source: {s_src} | Reason: {s_reason} | Root Cause: {s_rc}")
         prev_strikes_text = "\n".join(items)
 
+    subgoal_block = ""
+    if subgoal_description:
+        subgoal_block += f"ACTIVE SUBGOAL:\n{subgoal_description}\n\n"
+    if subgoal_scope:
+        subgoal_block += f"ALLOWED FILE SCOPE:\n{', '.join(subgoal_scope)}\n\n"
+
     prompt = (
         "You are an advisory post-mortem analyzer for an autonomous coding agent.\n"
         "Analyze why the following implementation attempt failed its verification gate.\n\n"
         f"TICKET:\n{ticket}\n\n"
+        f"{subgoal_block}"
         f"STRIKE:\n{strike_number}\n\n"
         f"PREVIOUS STRIKES:\n{prev_strikes_text}\n\n"
         f"REJECTING VERDICT:\nSource: {rejecting_source}\nReason / Error Output:\n{cleaned_reason}\n\n"
@@ -315,6 +324,8 @@ class QwenClient:
         thread_id: Optional[str] = None,
         subgoal_id: Optional[str] = None,
         strike_idx: int = 1,
+        subgoal_description: Optional[str] = None,
+        subgoal_scope: Optional[List[str]] = None,
     ) -> Optional[QwenPostmortemResult]:
         """Runs the advisory post-mortem via llama-server.
 
@@ -332,6 +343,8 @@ class QwenClient:
             strike_number=strike_number,
             previous_strikes=previous_strikes,
             max_diff_chars=self.max_diff_chars,
+            subgoal_description=subgoal_description,
+            subgoal_scope=subgoal_scope,
         )
 
         model_to_use = self.model or "default"

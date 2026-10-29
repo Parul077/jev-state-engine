@@ -2275,6 +2275,8 @@ def _invoke_qwen_strike_postmortem(
             thread_id=thread_id,
             subgoal_id=subgoal_id,
             strike_idx=total_strikes,
+            subgoal_description=getattr(subgoal, "description", None),
+            subgoal_scope=getattr(subgoal, "scope", None),
         )
         if res:
             strike_history.append({
